@@ -1,0 +1,28 @@
+{
+  "name": "sales",
+  "version": "1.0.0",
+  "description": "A backend for a job a application ",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node BACKEND/src/index.js",
+    "dev": "nodemon BACKEND/src/index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lanreoyekanmi/Sales.git"
+  },
+  "author": "Olanrewaju",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/lanreoyekanmi/Sales/issues"
+  },
+  "homepage": "https://github.com/lanreoyekanmi/Sales#readme",
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "mongoose": "^9.10.0",
+    "nodemon": "^3.1.14"
+  }
+}
