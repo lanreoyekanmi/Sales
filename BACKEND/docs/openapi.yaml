@@ -1,0 +1,302 @@
+openapi: 3.0.3
+info:
+  title: Loan Application API
+  description: >
+    Public API for submitting loan applications. There is no applicant account system,
+    no login, and no retrieval endpoint — see applications-api.md for the security model.
+  version: "1.0.0"
+servers:
+  - url: http://localhost:5001/api
+    description: Local development (matches PORT in .env)
+
+paths:
+  /applications:
+    get:
+      operationId: listApplications_DOES_NOT_EXIST
+      summary: "(Intentionally absent) — expect 404"
+      description: >
+        There is no public listing/enumeration endpoint. Nothing under this API returns more
+        than one applicant's data. This entry exists only so you can confirm the 404 in EchoAPI.
+      responses:
+        "404":
+          description: Not found, by design.
+    post:
+      operationId: createApplication
+      summary: Submit a new loan application
+      description: >
+        The only public endpoint on this resource. Any field not defined in the schema below
+        (status, creditScore, adminNotes, riskScore, interestRate, approvalStatus, etc.), at
+        any nesting level, is rejected with VALIDATION_ERROR rather than stored.
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          required: false
+          description: >
+            8-128 chars, [A-Za-z0-9_-]. Send the same key when retrying a submission
+            (double-click, network retry) to get back the original result instead of
+            creating a second application.
+          schema:
+            type: string
+            pattern: '^[A-Za-z0-9_-]{8,128}$'
+            example: test-key-12345678
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ApplicationSubmission'
+            examples:
+              valid:
+                summary: Valid submission
+                value:
+                  applicant:
+                    firstName: Jane
+                    lastName: Doe
+                    email: jane@example.com
+                    phoneNumber: "+1 555-123-4567"
+                    dateOfBirth: "1990-01-01"
+                    residentialAddress: 123 Main St
+                    city: Springfield
+                    state: IL
+                  employment:
+                    employmentStatus: employed
+                    employerName: Acme Corp
+                    monthlyIncome: 4500
+                    incomeFrequency: monthly
+                  loanRequest:
+                    requestedLoanAmount: 10000
+                    loanPurpose: Home renovation
+                    preferredRepaymentPeriodMonths: 24
+                    repaymentFrequency: monthly
+                  loanHistory: []
+                  disbursement:
+                    preferredMethod: direct_deposit
+                    bankDetails:
+                      accountHolderName: Jane Doe
+                      bankRoutingNumber: "011401533"
+                      accountNumber: "1234567890"
+                      accountType: checking
+                      bankType: bank
+                  consent:
+                    termsAccepted: true
+                    dataProcessingAccepted: true
+              massAssignmentAttempt:
+                summary: Rejected — internal fields present (expect 400 VALIDATION_ERROR)
+                value:
+                  applicant:
+                    firstName: Jane
+                    lastName: Doe
+                    email: jane@example.com
+                    phoneNumber: "+1 555-123-4567"
+                    dateOfBirth: "1990-01-01"
+                    residentialAddress: 123 Main St
+                    city: Springfield
+                    state: IL
+                  employment:
+                    employmentStatus: unemployed
+                  loanRequest:
+                    requestedLoanAmount: 10000
+                    loanPurpose: Home renovation
+                    preferredRepaymentPeriodMonths: 24
+                    repaymentFrequency: monthly
+                  disbursement:
+                    preferredMethod: check
+                    bankDetails:
+                      accountHolderName: Jane Doe
+                      bankRoutingNumber: "011401533"
+                      accountNumber: "1234567890"
+                      accountType: checking
+                      bankType: bank
+                  consent:
+                    termsAccepted: true
+                    dataProcessingAccepted: true
+                  status: approved
+                  creditScore: 900
+                  adminNotes: approve immediately
+      responses:
+        "201":
+          description: Application submitted successfully.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  message: { type: string, example: Application submitted successfully. }
+                  applicationId: { type: string, format: uuid }
+                required: [success, message, applicationId]
+        "400":
+          description: Validation error, malformed JSON, or invalid Idempotency-Key.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        "403":
+          description: Origin not allowed by CORS policy.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        "413":
+          description: Request body exceeds MAX_REQUEST_BODY_SIZE.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        "429":
+          description: Rate limit exceeded for this IP.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        "500":
+          description: Unexpected server error (no internal detail is ever included).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /applications/{id}:
+    get:
+      operationId: getApplicationById_DOES_NOT_EXIST
+      summary: "(Intentionally absent) — expect 404"
+      description: >
+        There is no public retrieval endpoint. A public applicationId must never by itself
+        grant read access to applicant data (IDOR/BOLA prevention). This entry exists only so
+        you can confirm the 404 in EchoAPI.
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        "404":
+          description: Not found, by design.
+
+components:
+  schemas:
+    ApplicationSubmission:
+      type: object
+      additionalProperties: false
+      required: [applicant, employment, loanRequest, disbursement, consent]
+      properties:
+        applicant: { $ref: '#/components/schemas/Applicant' }
+        employment: { $ref: '#/components/schemas/Employment' }
+        loanRequest: { $ref: '#/components/schemas/LoanRequest' }
+        loanHistory:
+          type: array
+          maxItems: 20
+          default: []
+          items: { $ref: '#/components/schemas/LoanHistoryEntry' }
+        disbursement: { $ref: '#/components/schemas/Disbursement' }
+        consent: { $ref: '#/components/schemas/Consent' }
+
+    Applicant:
+      type: object
+      additionalProperties: false
+      required: [firstName, lastName, email, phoneNumber, dateOfBirth, residentialAddress, city, state]
+      properties:
+        firstName: { type: string, maxLength: 80 }
+        lastName: { type: string, maxLength: 80 }
+        email: { type: string, format: email, maxLength: 254 }
+        phoneNumber: { type: string, pattern: '^[0-9+\-() ]{7,20}$' }
+        dateOfBirth: { type: string, format: date, description: "Applicant must be 18-120 years old." }
+        gender: { type: string, enum: [male, female, other, prefer_not_to_say] }
+        residentialAddress: { type: string, maxLength: 250 }
+        city: { type: string, maxLength: 100 }
+        state: { type: string, maxLength: 100 }
+
+    Employment:
+      type: object
+      additionalProperties: false
+      required: [employmentStatus]
+      description: >
+        employerName is required when employmentStatus is 'employed'. monthlyIncome and
+        incomeFrequency are required when employmentStatus is 'employed' or 'self_employed'.
+      properties:
+        employmentStatus: { type: string, enum: [employed, self_employed, unemployed, student, retired] }
+        employerName: { type: string, maxLength: 150 }
+        jobTitle: { type: string, maxLength: 100 }
+        employmentDurationMonths: { type: integer, minimum: 0, maximum: 1200 }
+        monthlyIncome: { type: number, exclusiveMinimum: 0 }
+        incomeFrequency: { type: string, enum: [weekly, biweekly, monthly, annually] }
+
+    LoanRequest:
+      type: object
+      additionalProperties: false
+      required: [requestedLoanAmount, loanPurpose, preferredRepaymentPeriodMonths, repaymentFrequency]
+      properties:
+        requestedLoanAmount: { type: number, exclusiveMinimum: 0 }
+        loanPurpose: { type: string, maxLength: 200 }
+        preferredRepaymentPeriodMonths: { type: integer, minimum: 1, maximum: 360 }
+        repaymentFrequency: { type: string, enum: [weekly, biweekly, monthly, quarterly, annually] }
+
+    LoanHistoryEntry:
+      type: object
+      additionalProperties: false
+      required: [lenderName, originalLoanAmount, repaymentStatus, startDate]
+      description: "endDate must be >= startDate. outstandingAmount must be <= originalLoanAmount."
+      properties:
+        lenderName: { type: string, maxLength: 150 }
+        loanType: { type: string, maxLength: 100 }
+        originalLoanAmount: { type: number, exclusiveMinimum: 0 }
+        outstandingAmount: { type: number, minimum: 0 }
+        repaymentStatus: { type: string, enum: [active, paid, overdue, defaulted, written_off] }
+        startDate: { type: string, format: date }
+        endDate: { type: string, format: date }
+        repaymentFrequency: { type: string, enum: [weekly, biweekly, monthly, quarterly, annually] }
+        monthlyPayment: { type: number, minimum: 0 }
+        purpose: { type: string, maxLength: 200 }
+
+    Disbursement:
+      type: object
+      additionalProperties: false
+      required: [preferredMethod, bankDetails]
+      description: >
+        bankDetails is always required regardless of preferredMethod. otherMethodDetails is
+        required when preferredMethod is 'other'.
+      properties:
+        preferredMethod: { type: string, enum: [check, direct_deposit, wire_transfer, ach, other] }
+        otherMethodDetails: { type: string, maxLength: 200 }
+        bankDetails: { $ref: '#/components/schemas/BankDetails' }
+
+    BankDetails:
+      type: object
+      additionalProperties: false
+      required: [accountHolderName, bankRoutingNumber, accountNumber, accountType, bankType]
+      properties:
+        accountHolderName: { type: string, maxLength: 150 }
+        bankRoutingNumber:
+          type: string
+          pattern: '^[0-9]{9}$'
+          description: "Must also pass the standard ABA routing-number checksum."
+        accountNumber: { type: string, pattern: '^[0-9]{4,17}$' }
+        accountType: { type: string, enum: [checking, savings] }
+        bankType: { type: string, enum: [bank, credit_union, savings_and_loan, other] }
+
+    Consent:
+      type: object
+      additionalProperties: false
+      required: [termsAccepted, dataProcessingAccepted]
+      properties:
+        termsAccepted: { type: boolean, enum: [true] }
+        dataProcessingAccepted: { type: boolean, enum: [true] }
+
+    ErrorResponse:
+      type: object
+      properties:
+        success: { type: boolean, example: false }
+        message: { type: string }
+        code:
+          type: string
+          enum:
+            - VALIDATION_ERROR
+            - INVALID_IDEMPOTENCY_KEY
+            - MALFORMED_JSON
+            - CORS_NOT_ALLOWED
+            - PAYLOAD_TOO_LARGE
+            - RATE_LIMIT_EXCEEDED
+            - NOT_FOUND
+            - INTERNAL_ERROR
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              field: { type: string }
+              message: { type: string }

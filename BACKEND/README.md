@@ -1,69 +1,72 @@
-# Backend API
+# Loan Application Backend
 
-A Node.js backend service using Express and MongoDB for data persistence.
+A small, focused Node.js/Express/MongoDB API that receives and securely stores loan
+applications submitted from the public website. There is no applicant account system, no
+login, and no payment or repayment processing — see
+[docs/applications-api.md](docs/applications-api.md) for the full API reference and security
+model.
 
 ## Features
 
-- RESTful API endpoints
-- MongoDB database integration
-- Authentication & authorization
-- Error handling and validation
-- Environment configuration
+- `POST /api/applications` — the only public endpoint
+- Strict server-side validation (zod) — unknown/internal fields (status, credit score, admin
+  notes, etc.) are always rejected, never stored
+- No public retrieval, listing, admin, or debug endpoints — a public `applicationId` grants no
+  read access to applicant data
+- Per-IP rate limiting, request size limits, CORS allowlist, security headers (helmet)
+- Idempotent retries via an optional `Idempotency-Key` header
 
 ## Prerequisites
 
-- Node.js (v14 or higher)
-- MongoDB (local or Atlas connection string)
-- npm or yarn
+- Node.js v22+
+- A MongoDB connection string (local or Atlas)
 
 ## Installation
 
-1. Clone the repository
-2. Install dependencies:
-   ```bash
-   npm install
-   ```
+From the repository root:
 
-3. Create a `.env` file in the root directory:
-   ```
-   MONGODB_URI=mongodb://localhost:27017/database_name
-   PORT=5000
-   NODE_ENV=development
-   ```
+```bash
+npm install
+```
+
+Copy [`.env.example`](../.env.example) (at the repository root) to `.env` and fill in real
+values.
 
 ## Running the Server
 
-Start the development server:
 ```bash
-npm start
-```
-
-Or with nodemon for auto-reload:
-```bash
-npm run dev
+npm start        # production
+npm run dev      # nodemon, auto-reload
+npm test         # runs BACKEND/src/tests
 ```
 
 ## API Documentation
 
-API endpoints are available at `http://localhost:5000/api`
+See [docs/applications-api.md](docs/applications-api.md).
 
 ## Technologies
 
 - **Express.js** - Web framework
 - **MongoDB** - NoSQL database
 - **Mongoose** - MongoDB object modeling
+- **zod** - request validation/DTOs
+- **helmet**, **cors**, **express-rate-limit** - security middleware
 
 ## Project Structure
 
 ```
-├── src/
-│   ├── models/
-│   ├── routes/
-│   ├── controllers/
-│   ├── middleware/
-│   └── app.js
-├── .env
-└── package.json
+src/
+├── app.js                  Express app: security middleware, routing, error handling
+├── index.js                Loads env, connects DB, starts the HTTP server
+├── config/                 constants, database connection, CORS policy
+├── models/                 Mongoose schemas (Application, IdempotencyKey)
+├── validators/              zod request schemas (public input DTOs)
+├── services/                business logic, never trusts the raw request body
+├── controllers/             request/response glue
+├── routes/                   route definitions
+├── middleware/               requestId, rate limiting, 404/error handlers
+├── utils/                    ApiError, asyncHandler, logger, money helpers
+└── tests/                    node:test suites
 ```
 
 ## License
