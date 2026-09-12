@@ -24,17 +24,21 @@ paths:
       operationId: createApplication
       summary: Submit a new loan application
       description: >
-        The only public endpoint on this resource. Any field not defined in the schema below
-        (status, creditScore, adminNotes, riskScore, interestRate, approvalStatus, etc.), at
-        any nesting level, is rejected with VALIDATION_ERROR rather than stored.
+        The only public creation endpoint on this resource. multipart/form-data, not JSON:
+        the application fields travel as a JSON string in the "data" part, alongside three
+        required image files. The application is never created if any of the three is
+        missing or fails to decode as an image — nothing is persisted without them. Any field
+        not defined in the ApplicationSubmission schema (status, creditScore, adminNotes,
+        riskScore, interestRate, approvalStatus, etc.), at any nesting level, is rejected with
+        VALIDATION_ERROR rather than stored.
       parameters:
         - in: header
           name: Idempotency-Key
           required: false
           description: >
-            8-128 chars, [A-Za-z0-9_-]. Send the same key when retrying a submission
-            (double-click, network retry) to get back the original result instead of
-            creating a second application.
+            8-128 chars, [A-Za-z0-9_-]. Send the same key (and the same files) when retrying a
+            submission (double-click, network retry) to get back the original result instead
+            of creating a second application and re-processing the images.
           schema:
             type: string
             pattern: '^[A-Za-z0-9_-]{8,128}$'
@@ -42,77 +46,31 @@ paths:
       requestBody:
         required: true
         content:
-          application/json:
+          multipart/form-data:
             schema:
-              $ref: '#/components/schemas/ApplicationSubmission'
-            examples:
-              valid:
-                summary: Valid submission
-                value:
-                  applicant:
-                    firstName: Jane
-                    lastName: Doe
-                    email: jane@example.com
-                    phoneNumber: "+1 555-123-4567"
-                    dateOfBirth: "1990-01-01"
-                    residentialAddress: 123 Main St
-                    city: Springfield
-                    state: IL
-                  employment:
-                    employmentStatus: employed
-                    employerName: Acme Corp
-                    monthlyIncome: 4500
-                    incomeFrequency: monthly
-                  loanRequest:
-                    requestedLoanAmount: 10000
-                    loanPurpose: Home renovation
-                    preferredRepaymentPeriodMonths: 24
-                    repaymentFrequency: monthly
-                  loanHistory: []
-                  disbursement:
-                    preferredMethod: direct_deposit
-                    bankDetails:
-                      accountHolderName: Jane Doe
-                      bankRoutingNumber: "011401533"
-                      accountNumber: "1234567890"
-                      accountType: checking
-                      bankType: bank
-                  consent:
-                    termsAccepted: true
-                    dataProcessingAccepted: true
-              massAssignmentAttempt:
-                summary: Rejected — internal fields present (expect 400 VALIDATION_ERROR)
-                value:
-                  applicant:
-                    firstName: Jane
-                    lastName: Doe
-                    email: jane@example.com
-                    phoneNumber: "+1 555-123-4567"
-                    dateOfBirth: "1990-01-01"
-                    residentialAddress: 123 Main St
-                    city: Springfield
-                    state: IL
-                  employment:
-                    employmentStatus: unemployed
-                  loanRequest:
-                    requestedLoanAmount: 10000
-                    loanPurpose: Home renovation
-                    preferredRepaymentPeriodMonths: 24
-                    repaymentFrequency: monthly
-                  disbursement:
-                    preferredMethod: check
-                    bankDetails:
-                      accountHolderName: Jane Doe
-                      bankRoutingNumber: "011401533"
-                      accountNumber: "1234567890"
-                      accountType: checking
-                      bankType: bank
-                  consent:
-                    termsAccepted: true
-                    dataProcessingAccepted: true
-                  status: approved
-                  creditScore: 900
-                  adminNotes: approve immediately
+              type: object
+              required: [data, idCardImage, ssnCardImage, selfieImage]
+              properties:
+                data:
+                  type: string
+                  description: JSON-encoded ApplicationSubmission object (see schema below).
+                  example: >-
+                    {"applicant":{"firstName":"Jane","lastName":"Doe","email":"jane@example.com","phoneNumber":"+1 555-123-4567","dateOfBirth":"1990-01-01","residentialAddress":"123 Main St","city":"Springfield","state":"IL"},"employment":{"employmentStatus":"employed","employerName":"Acme Corp","monthlyIncome":4500,"incomeFrequency":"monthly"},"loanRequest":{"requestedLoanAmount":10000,"loanPurpose":"Home renovation","preferredRepaymentPeriodMonths":24,"repaymentFrequency":"monthly"},"loanHistory":[],"disbursement":{"preferredMethod":"direct_deposit","bankDetails":{"accountHolderName":"Jane Doe","bankRoutingNumber":"011401533","accountNumber":"1234567890","accountType":"checking","bankType":"bank"}},"consent":{"termsAccepted":true,"dataProcessingAccepted":true}}
+                idCardImage:
+                  type: string
+                  format: binary
+                  description: Photo of a government-issued ID card. JPEG, PNG, or WEBP.
+                ssnCardImage:
+                  type: string
+                  format: binary
+                  description: Photo of the applicant's SSN card/document. JPEG, PNG, or WEBP.
+                selfieImage:
+                  type: string
+                  format: binary
+                  description: A selfie for identity verification. JPEG, PNG, or WEBP.
+              encoding:
+                data:
+                  contentType: application/json
       responses:
         "201":
           description: Application submitted successfully.
@@ -126,7 +84,10 @@ paths:
                   applicationId: { type: string, format: uuid }
                 required: [success, message, applicationId]
         "400":
-          description: Validation error, malformed JSON, or invalid Idempotency-Key.
+          description: >
+            Validation error in the "data" JSON, malformed "data" JSON, missing/invalid
+            Idempotency-Key, a missing required image field, or an image that is not a
+            valid/decodable image (INVALID_IMAGE).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ErrorResponse' }
@@ -136,7 +97,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/ErrorResponse' }
         "413":
-          description: Request body exceeds MAX_REQUEST_BODY_SIZE.
+          description: One of the uploaded images exceeds MAX_DOCUMENT_UPLOAD_SIZE_BYTES.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ErrorResponse' }
@@ -167,6 +128,63 @@ paths:
       responses:
         "404":
           description: Not found, by design.
+
+  /applications/{applicationId}/documents:
+    post:
+      operationId: replaceApplicationDocument
+      summary: Replace one verification image on an existing application
+      description: >
+        For retakes only (e.g. a blurry ID photo) — the application already has all three
+        images from creation. applicationId is the only access control: it grants no read
+        access to any applicant data, only permission to replace one image on that specific
+        application. Same IDOR caveat as the Idempotency-Key design: do not rely on this
+        alone if the threat model changes.
+      parameters:
+        - in: path
+          name: applicationId
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [kind, image]
+              properties:
+                kind: { type: string, enum: [id_card, ssn_card, selfie] }
+                image: { type: string, format: binary }
+      responses:
+        "201":
+          description: Document replaced successfully.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  message: { type: string }
+                  kind: { type: string, enum: [id_card, ssn_card, selfie] }
+        "400":
+          description: Invalid kind, missing image, or image fails to decode (INVALID_IMAGE).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        "404":
+          description: No application exists for this applicationId.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        "413":
+          description: Image exceeds MAX_DOCUMENT_UPLOAD_SIZE_BYTES.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        "429":
+          description: Rate limit exceeded for this IP.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
 
 components:
   schemas:
@@ -287,6 +305,8 @@ components:
           enum:
             - VALIDATION_ERROR
             - INVALID_IDEMPOTENCY_KEY
+            - INVALID_IMAGE
+            - APPLICATION_NOT_FOUND
             - MALFORMED_JSON
             - CORS_NOT_ALLOWED
             - PAYLOAD_TOO_LARGE

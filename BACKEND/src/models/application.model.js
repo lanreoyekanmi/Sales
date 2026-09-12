@@ -5,6 +5,7 @@ import {
   BANK_ACCOUNT_TYPES,
   BANK_TYPES,
   DISBURSEMENT_METHODS,
+  DOCUMENT_KINDS,
   EMPLOYMENT_STATUSES,
   GENDERS,
   INCOME_FREQUENCIES,
@@ -98,6 +99,25 @@ const disbursementSchema = new Schema(
   { _id: false }
 );
 
+// publicId uses `select: false` for the same reason as the bank fields above: it is the
+// internal Cloudinary reference needed to manage or later retrieve the asset, not
+// applicant-facing data, so no default query — including a future internal one — returns it.
+// The image bytes themselves are never stored in MongoDB, only this metadata; Cloudinary is
+// the system of record for the actual file, stored with `type: "authenticated"` (see
+// cloudinaryStorage.adapter.js) so it is not reachable at a plain public URL.
+const documentSchema = new Schema(
+  {
+    kind: { type: String, required: true, enum: DOCUMENT_KINDS },
+    publicId: { type: String, required: true, select: false },
+    resourceType: { type: String, required: true },
+    deliveryType: { type: String, required: true },
+    format: { type: String, required: true },
+    bytes: { type: Number, required: true },
+    uploadedAt: { type: Date, required: true, default: Date.now },
+  },
+  { _id: false }
+);
+
 const consentSchema = new Schema(
   {
     termsAccepted: { type: Boolean, required: true },
@@ -144,6 +164,18 @@ const applicationSchema = new Schema(
       },
     },
     disbursement: { type: disbursementSchema, required: true },
+    // Required at creation time — POST /api/applications rejects the request before ever
+    // building this document if any of the three is missing. This validator is a data-layer
+    // backstop against a future code path saving an application without them.
+    documents: {
+      type: [documentSchema],
+      default: [],
+      validate: {
+        validator: (docs) =>
+          DOCUMENT_KINDS.every((kind) => docs.some((doc) => doc.kind === kind)),
+        message: `An application must include one document for each of: ${DOCUMENT_KINDS.join(", ")}.`,
+      },
+    },
     consent: { type: consentSchema, required: true },
     metadata: { type: metadataSchema, required: true },
   },

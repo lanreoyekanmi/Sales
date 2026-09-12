@@ -55,3 +55,14 @@ export const DISBURSEMENT_METHODS = [
 export const BANK_ACCOUNT_TYPES = ["checking", "savings"];
 
 export const BANK_TYPES = ["bank", "credit_union", "savings_and_loan", "other"];
+
+// Verification document images. All three are mandatory on POST /api/applications — an
+// application is never created without them. Each key is the multipart field name the client
+// uploads under; each value is the "kind" stored against the application.
+export const DOCUMENT_UPLOAD_FIELDS = {
+  idCardImage: "id_card",
+  ssnCardImage: "ssn_card",
+  selfieImage: "selfie",
+};
+
+export const DOCUMENT_KINDS = Object.values(DOCUMENT_UPLOAD_FIELDS);

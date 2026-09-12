@@ -15,3 +15,19 @@ export const applicationSubmissionLimiter = rateLimit({
     code: "RATE_LIMIT_EXCEEDED",
   },
 });
+
+const DOCUMENT_UPLOAD_WINDOW_MS =
+  Number(process.env.DOCUMENT_UPLOAD_RATE_LIMIT_WINDOW_MS) || 15 * 60 * 1000;
+const DOCUMENT_UPLOAD_MAX_REQUESTS = Number(process.env.DOCUMENT_UPLOAD_RATE_LIMIT_MAX) || 20;
+
+export const documentUploadLimiter = rateLimit({
+  windowMs: DOCUMENT_UPLOAD_WINDOW_MS,
+  max: DOCUMENT_UPLOAD_MAX_REQUESTS,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    success: false,
+    message: "Too many document uploads from this network. Please try again later.",
+    code: "RATE_LIMIT_EXCEEDED",
+  },
+});
