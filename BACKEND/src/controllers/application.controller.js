@@ -5,9 +5,9 @@ import { uploadApplicationDocument as uploadDocument } from "../services/documen
 import { asyncHandler } from "../utils/asyncHandler.js";
 import ApiError from "../utils/ApiError.js";
 import { DOCUMENT_KINDS, DOCUMENT_UPLOAD_FIELDS } from "../config/constants.js";
+import { isValidApplicationId } from "../utils/applicationId.js";
 
 const IDEMPOTENCY_KEY_REGEX = /^[A-Za-z0-9_-]{8,128}$/;
-const APPLICATION_ID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export const createApplication = asyncHandler(async (req, res) => {
   // multer (applicationUpload) has already run: text fields are on req.body, the three
@@ -86,7 +86,9 @@ export const createApplication = asyncHandler(async (req, res) => {
 export const uploadApplicationDocument = asyncHandler(async (req, res) => {
   const { applicationId } = req.params;
   // Same 404 regardless of whether the ID is malformed or just unknown — no signal either way.
-  if (!APPLICATION_ID_REGEX.test(applicationId)) {
+  // Accepts both the current human-readable format and the legacy UUID format still used by
+  // applications created before it existed (see utils/applicationId.js).
+  if (!isValidApplicationId(applicationId)) {
     throw new ApiError(404, "APPLICATION_NOT_FOUND", "No application was found for this ID.");
   }
 

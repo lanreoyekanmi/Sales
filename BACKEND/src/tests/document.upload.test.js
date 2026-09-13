@@ -4,8 +4,16 @@ import { randomUUID } from "node:crypto";
 import dotenv from "dotenv";
 import mongoose from "mongoose";
 import sharp from "sharp";
+import { generateApplicationId } from "../utils/applicationId.js";
 
 dotenv.config({ path: ".env" });
+
+// This file's before() creates a real application via a real successful submission and never
+// mocks telegramNotifier — with the real TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID from .env still
+// set, that submission would otherwise send a real notification to the real Telegram channel.
+// Telegram's own behavior is covered in telegram.service.test.js and telegram.notification.test.js.
+delete process.env.TELEGRAM_BOT_TOKEN;
+delete process.env.TELEGRAM_CHAT_ID;
 
 process.env.APPLICATION_RATE_LIMIT_MAX = "1000";
 process.env.DOCUMENT_UPLOAD_RATE_LIMIT_MAX = "1000";
@@ -289,5 +297,73 @@ describe("POST /api/applications/:applicationId/documents", () => {
     );
     assert.equal(status, 404);
     assert.equal(json.code, "APPLICATION_NOT_FOUND");
+  });
+
+  test("returns 404 for a well-formed but unknown applicationId in the current LN- format", async () => {
+    const { status, json } = await postForm(
+      `/api/applications/${generateApplicationId()}/documents`,
+      buildDocumentForm()
+    );
+    assert.equal(status, 404);
+    assert.equal(json.code, "APPLICATION_NOT_FOUND");
+  });
+
+  test("supports retaking a document on a legacy UUID-format application (backward compatibility)", async () => {
+    // Simulates an application created before the LN-YYYYMMDD-XXXXXXX format existed: its
+    // applicationId is still a crypto.randomUUID() value, and the retake endpoint must keep
+    // routing to it exactly as it did before that format was introduced.
+    const legacyId = randomUUID();
+    await new Application({
+      applicationId: legacyId,
+      applicant: {
+        firstName: "Legacy",
+        lastName: "User",
+        email: `legacy+${randomUUID()}@example.com`,
+        phoneNumber: "+1 555-000-0000",
+        dateOfBirth: new Date("1985-05-05"),
+        residentialAddress: "1 Old St",
+        city: "Oldtown",
+        state: "OT",
+      },
+      employment: { employmentStatus: "unemployed" },
+      loanRequest: {
+        requestedLoanAmount: 500,
+        loanPurpose: "legacy application backward-compatibility test",
+        preferredRepaymentPeriodMonths: 6,
+        repaymentFrequency: "monthly",
+      },
+      disbursement: {
+        preferredMethod: "direct_deposit",
+        bankDetails: {
+          accountHolderName: "Legacy User",
+          bankRoutingNumber: "011401533",
+          accountNumber: "1234567890",
+          accountType: "checking",
+          bankType: "bank",
+        },
+      },
+      documents: ["id_card", "ssn_card", "selfie"].map((kind) => ({
+        kind,
+        publicId: `${uploadFolder}/${legacyId}/${kind}-legacy`,
+        resourceType: "image",
+        deliveryType: "authenticated",
+        format: "jpg",
+        bytes: 1,
+      })),
+      consent: { termsAccepted: true, dataProcessingAccepted: true },
+      metadata: {},
+    }).save();
+
+    const { status, json } = await postForm(
+      `/api/applications/${legacyId}/documents`,
+      buildDocumentForm({ kind: "selfie" })
+    );
+    assert.equal(status, 201);
+    assert.equal(json.success, true);
+
+    const stored = await Application.findOne({ applicationId: legacyId }).lean();
+    assert.equal(stored.documents.length, 3, "the other two legacy documents must be untouched");
+    const selfieDoc = stored.documents.find((d) => d.kind === "selfie");
+    assert.equal(selfieDoc.deliveryType, "authenticated");
   });
 });

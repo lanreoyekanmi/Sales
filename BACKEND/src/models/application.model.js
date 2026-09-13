@@ -1,5 +1,5 @@
 import mongoose from "mongoose";
-import { randomUUID } from "node:crypto";
+import { generateApplicationId } from "../utils/applicationId.js";
 import {
   APPLICATION_STATUSES,
   BANK_ACCOUNT_TYPES,
@@ -12,6 +12,7 @@ import {
   LOAN_REPAYMENT_STATUSES,
   MAX_LOAN_HISTORY_RECORDS,
   REPAYMENT_FREQUENCIES,
+  TELEGRAM_NOTIFICATION_STATUSES,
 } from "../config/constants.js";
 
 const { Schema } = mongoose;
@@ -137,14 +138,38 @@ const metadataSchema = new Schema(
   { _id: false }
 );
 
+// Tracks the operational Telegram notification for this application, durably (in MongoDB)
+// rather than in an in-memory flag, so a retried/duplicate notification attempt can be
+// recognized and skipped even across process restarts. Internal only — never returned in any
+// API response. See services/telegram.service.js and the notification step in
+// services/application.service.js.
+const telegramNotificationSchema = new Schema(
+  {
+    status: {
+      type: String,
+      enum: TELEGRAM_NOTIFICATION_STATUSES,
+      default: "pending",
+    },
+    lastAttemptAt: { type: Date },
+    sentAt: { type: Date },
+  },
+  { _id: false }
+);
+
 const applicationSchema = new Schema(
   {
+    // Human-readable public identifier, e.g. "LN-20260913-A7K4P9X" (see utils/applicationId.js)
+    // — distinct from MongoDB's own `_id`, which remains the internal primary key and is never
+    // exposed to applicants. Applications created before this format existed keep their
+    // original crypto.randomUUID() value here; both shapes coexist under the same `unique`
+    // index, and this default is only a backstop — submitApplication always generates and
+    // passes its own value explicitly.
     applicationId: {
       type: String,
       required: true,
       unique: true,
       index: true,
-      default: () => randomUUID(),
+      default: () => generateApplicationId(),
     },
     status: {
       type: String,
@@ -178,6 +203,7 @@ const applicationSchema = new Schema(
     },
     consent: { type: consentSchema, required: true },
     metadata: { type: metadataSchema, required: true },
+    telegramNotification: { type: telegramNotificationSchema, default: () => ({}) },
   },
   { timestamps: true }
 );

@@ -7,6 +7,13 @@ import sharp from "sharp";
 
 dotenv.config({ path: ".env" });
 
+// This file exercises real successful submissions and never mocks telegramNotifier — with the
+// real TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID from .env still set, every successful submission
+// below would otherwise send a real notification to the real Telegram channel. Telegram's own
+// behavior is covered in telegram.service.test.js and telegram.notification.test.js instead.
+delete process.env.TELEGRAM_BOT_TOKEN;
+delete process.env.TELEGRAM_CHAT_ID;
+
 // This file exercises many submissions against one in-process app instance/rate limiter.
 // Actual rate-limiting behavior has its own dedicated, isolated test in rateLimiter.test.js —
 // raise the limit here so it doesn't interfere with these functional assertions.
@@ -154,7 +161,7 @@ describe("POST /api/applications", () => {
     assert.equal(status, 201);
     assert.deepEqual(Object.keys(json).sort(), ["applicationId", "message", "success"]);
     assert.equal(json.success, true);
-    assert.match(json.applicationId, /^[0-9a-f-]{36}$/i);
+    assert.match(json.applicationId, /^LN-\d{8}-[A-Z0-9]{7}$/);
 
     const after = await Application.countDocuments();
     assert.equal(after, before + 1);
@@ -208,6 +215,22 @@ describe("POST /api/applications", () => {
     assert.equal(status, 400);
     assert.equal(json.success, false);
     assert.equal(json.code, "VALIDATION_ERROR");
+  });
+
+  test("ignores/rejects a client-supplied applicationId and always generates its own", async () => {
+    const before = await Application.countDocuments();
+    const clientSuppliedId = "LN-19990101-ZZZZZZZ";
+    const data = { ...validData(), applicationId: clientSuppliedId };
+    const { status, json } = await postForm("/api/applications", buildFormData({ data }));
+
+    // The request schema is `.strict()` and does not list applicationId among its accepted
+    // fields, so a client attempting to supply one is rejected outright rather than trusted.
+    assert.equal(status, 400);
+    assert.equal(json.code, "VALIDATION_ERROR");
+    assert.equal(await Application.countDocuments(), before);
+
+    const stored = await Application.findOne({ applicationId: clientSuppliedId }).lean();
+    assert.equal(stored, null, "the client-supplied applicationId must never be persisted");
   });
 
   test("rejects internal-only fields (status, creditScore, adminNotes) and stores nothing", async () => {

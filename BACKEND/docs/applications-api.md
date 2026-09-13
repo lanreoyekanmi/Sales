@@ -94,11 +94,12 @@ chosen (including `check` and `other`).
 
 | Field | Set by |
 |---|---|
-| `applicationId` | server, `crypto.randomUUID()` — the only public identifier for an application |
+| `applicationId` | server, e.g. `LN-20260913-A7K4P9X` (see [ID format](#application-id-format)) — the only public identifier for an application |
 | `status` | server, always `"submitted"` on creation; changed only by an internal process added later |
 | `createdAt` / `updatedAt` | server (Mongoose timestamps) |
 | `consent.acceptedAt` | server, current time at submission |
 | `metadata.submittedAt`, `metadata.sourceIp`, `metadata.userAgent` | server, for audit/abuse investigation only — never returned in any response |
+| `telegramNotification.status`/`lastAttemptAt`/`sentAt` | server, tracks the operational Telegram notification for this application (`pending`/`sent`/`failed`) — never returned in any response |
 
 ### Success response — `201 Created`
 
@@ -106,9 +107,27 @@ chosen (including `check` and `other`).
 {
   "success": true,
   "message": "Application submitted successfully.",
-  "applicationId": "1d6e6b0a-8f6e-4b9a-9c0d-3a2f6e6b0a8f"
+  "applicationId": "LN-20260913-A7K4P9X"
 }
 ```
+
+### Application ID format
+
+`applicationId` is `LN-YYYYMMDD-XXXXXXX`: a fixed `LN` prefix, the UTC submission date, and a
+7-character cryptographically random alphanumeric segment (`crypto.randomInt`, never
+`Math.random()` — see [`utils/applicationId.js`](../src/utils/applicationId.js)). It carries no
+applicant information (no name, DOB, phone, or other PII) and is always generated server-side —
+a client cannot supply or influence it; the request schema above rejects any unrecognized field,
+`applicationId` included. Uniqueness is enforced by a `unique` index on
+`Application.applicationId` in MongoDB, independent of and in addition to MongoDB's own internal
+`_id`, which remains the database's primary key and is never returned by this API.
+
+Applications created before this format existed keep their original `crypto.randomUUID()`-style
+`applicationId` (e.g. `1d6e6b0a-8f6e-4b9a-9c0d-3a2f6e6b0a8f`) — those values are never rewritten,
+since Cloudinary's storage path for each application's documents is itself keyed by
+`applicationId` (see `cloudinaryStorage.adapter.js`), so changing an existing application's ID
+after the fact would orphan its already-uploaded documents. Both ID shapes are accepted
+everywhere an `applicationId` is read from a request (e.g. the document retake endpoint below).
 
 This is deliberately the entire response. The submitted applicant data, employment details,
 loan history, and internal metadata are never echoed back.
@@ -165,6 +184,28 @@ or environment values:
   (ABA routing-number checksum, digit-length checks) but never returned in any API response.
   If the business builds an internal review UI later, consider field-level encryption at rest
   for these two fields specifically, on top of the database's own encryption-at-rest.
+
+## Operational Telegram notification
+
+On a successful submission (after MongoDB persistence has already committed), the server sends
+an application summary and the three verification images to a private, staff-only Telegram
+channel — a notification channel only, not a storage or retrieval mechanism. This is entirely
+internal/operational and has no effect on the request/response contract above:
+
+- Only fields already documented in this file are included in the summary; bank/routing/account
+  numbers are never sent, and no authentication-secret-shaped field is ever sent.
+- Images are sent as the same processed (EXIF-stripped, re-encoded) image bytes already uploaded
+  to Cloudinary — never a Cloudinary URL, public ID, or other delivery detail, and never the raw
+  unprocessed upload.
+- If Telegram is unreachable or misconfigured, the application and its documents remain fully
+  persisted regardless; the failure only affects `telegramNotification.status` (see above) and is
+  logged without any applicant data, Telegram response body, or bot token.
+- If `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` are not set, this feature is disabled entirely and
+  has no effect on submission behavior.
+- Retaking a document (`POST /:applicationId/documents`) never triggers another full application
+  notification.
+
+See [`telegram.service.js`](../src/services/telegram.service.js) for the Telegram Bot API client.
 
 ## Environment variables
 

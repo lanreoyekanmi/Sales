@@ -66,3 +66,7 @@ export const DOCUMENT_UPLOAD_FIELDS = {
 };
 
 export const DOCUMENT_KINDS = Object.values(DOCUMENT_UPLOAD_FIELDS);
+
+// Tracks whether the operational Telegram notification for a submitted application has been
+// sent. Internal/operational only — never returned in any API response.
+export const TELEGRAM_NOTIFICATION_STATUSES = ["pending", "sent", "failed"];

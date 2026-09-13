@@ -1,9 +1,10 @@
-import { randomUUID } from "node:crypto";
 import Application from "../models/application.model.js";
 import IdempotencyKey from "../models/idempotencyKey.model.js";
+import { generateApplicationId } from "../utils/applicationId.js";
 import { toDecimal128 } from "../utils/money.js";
 import { processUploadedImage, InvalidImageError } from "../utils/imageProcessing.js";
 import { cloudinaryStorage } from "./cloudinaryStorage.adapter.js";
+import { telegramNotifier } from "./telegram.service.js";
 import logger from "../utils/logger.js";
 import ApiError from "../utils/ApiError.js";
 
@@ -103,13 +104,18 @@ export async function submitApplication(input, context) {
     }
   }
 
-  const applicationId = randomUUID();
+  const applicationId = generateApplicationId();
   const documents = [];
   // Tracks every asset actually persisted to Cloudinary so far, independent of whether Mongo
   // ever sees them. Cloudinary and MongoDB are two separate systems with no shared
   // transaction — if anything below fails partway through, the catch block deletes whatever
   // was already uploaded rather than leaving orphaned identity documents behind.
   const uploadedAssets = [];
+  // Keeps the already-computed processed (EXIF-stripped, re-encoded) buffer for each document
+  // kind so it can also be handed to Telegram after a successful save, instead of discarding it
+  // once Cloudinary has it — the smallest change that avoids ever re-fetching the image back
+  // from Cloudinary just to notify Telegram.
+  const processedImages = {};
   let doc;
 
   try {
@@ -127,6 +133,8 @@ export async function submitApplication(input, context) {
         }
         throw err;
       }
+
+      processedImages[kind] = processed.buffer;
 
       const uploaded = await cloudinaryStorage.uploadDocumentFile({
         applicationId,
@@ -178,5 +186,47 @@ export async function submitApplication(input, context) {
 
   logger.info("application_submitted", { requestId, applicationId: doc.applicationId });
 
+  await notifyTelegramSafely({ doc, images: processedImages, requestId });
+
   return response;
+}
+
+// Sends the operational "new application" notification to Telegram after the application is
+// already durably persisted (MongoDB remains the system of record either way). Never throws:
+// Telegram is an additional notification channel, not a prerequisite for a successful
+// submission, so any failure here is caught, recorded on the application, and logged safely —
+// it must never roll back or fail an already-saved application.
+export async function notifyTelegramSafely({ doc, images, requestId }) {
+  if (!telegramNotifier.isConfigured()) return;
+
+  try {
+    // Atomically claims this application's one notification attempt: only a still-"pending"
+    // application gets sent. Marking "failed" up front (flipped to "sent" only once every
+    // Telegram call below actually succeeds) means a duplicate/concurrent call for the same
+    // applicationId is a no-op instead of a second full notification — durable in MongoDB
+    // rather than an in-memory flag, so it also survives a process restart.
+    const claimed = await Application.findOneAndUpdate(
+      { applicationId: doc.applicationId, "telegramNotification.status": "pending" },
+      { $set: { "telegramNotification.status": "failed", "telegramNotification.lastAttemptAt": new Date() } }
+    );
+    if (!claimed) return;
+
+    await telegramNotifier.sendApplicationSummary(doc);
+    await telegramNotifier.sendApplicationImages(doc.applicationId, images);
+
+    await Application.updateOne(
+      { applicationId: doc.applicationId },
+      { $set: { "telegramNotification.status": "sent", "telegramNotification.sentAt": new Date() } }
+    );
+  } catch (err) {
+    // Never log err.message/stack here: Telegram API error payloads and network error messages
+    // are not guaranteed free of request details, matching the same rule the global error
+    // handler already applies to database driver errors.
+    logger.warn("telegram_notification_failed", {
+      requestId,
+      applicationId: doc.applicationId,
+      telegramHttpStatus: err?.telegramHttpStatus,
+      telegramErrorCode: err?.telegramErrorCode,
+    });
+  }
 }
