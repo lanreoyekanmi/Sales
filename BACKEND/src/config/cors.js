@@ -1,13 +1,21 @@
 const isProduction = process.env.NODE_ENV === "production";
 
-const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
+// Always allowed in production, regardless of ALLOWED_ORIGINS, so a missing/incomplete env var
+// on the hosting platform (e.g. Railway) can't silently break the deployed frontend.
+const PRODUCTION_FRONTEND_ORIGIN = "https://meridianloan.vercel.app";
+
+const envOrigins = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
   .map((origin) => origin.trim())
   .filter(Boolean);
 
-if (isProduction && allowedOrigins.length === 0) {
+const allowedOrigins = isProduction
+  ? Array.from(new Set([PRODUCTION_FRONTEND_ORIGIN, ...envOrigins]))
+  : envOrigins;
+
+if (isProduction && envOrigins.length === 0) {
   console.warn(
-    "[config/cors] ALLOWED_ORIGINS is not set in production. All cross-origin browser requests will be blocked."
+    "[config/cors] ALLOWED_ORIGINS is not set in production. Only the default production origin will be allowed."
   );
 }
 
