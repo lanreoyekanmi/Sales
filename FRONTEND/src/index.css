@@ -1,0 +1,117 @@
+@import "tailwindcss";
+
+@theme {
+  --shadow-card: 0 1px 2px 0 rgb(15 23 42 / 0.04), 0 1px 3px 0 rgb(15 23 42 / 0.06);
+  --shadow-card-hover: 0 4px 8px -2px rgb(15 23 42 / 0.06), 0 2px 4px -2px rgb(15 23 42 / 0.05);
+  --animate-fade-in: fade-in 0.3s ease-out;
+  --animate-slide-up: slide-up 0.35s ease-out;
+
+  @keyframes fade-in {
+    from {
+      opacity: 0;
+    }
+    to {
+      opacity: 1;
+    }
+  }
+  @keyframes slide-up {
+    from {
+      opacity: 0;
+      transform: translateY(8px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+}
+
+@layer base {
+  html {
+    -webkit-text-size-adjust: 100%;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+    scroll-behavior: smooth;
+    scroll-padding-top: 5rem;
+  }
+
+  body {
+    @apply bg-slate-50 text-slate-800;
+  }
+
+  ::selection {
+    @apply bg-teal-100 text-teal-950;
+  }
+
+  :focus-visible {
+    @apply outline-2 outline-offset-2 outline-teal-600;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    ::before,
+    ::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}
+
+@layer components {
+  .input-base {
+    @apply w-full rounded-lg border border-slate-300 bg-white px-3.5 py-2.5 text-[15px] text-slate-900
+      placeholder:text-slate-400 transition-colors duration-150
+      focus:border-teal-600 focus:outline-none focus:ring-4 focus:ring-teal-600/10
+      disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-400;
+  }
+
+  .input-error {
+    @apply border-red-400 focus:border-red-500 focus:ring-red-500/10;
+  }
+
+  .field-label {
+    @apply mb-1.5 block text-sm font-medium text-slate-700;
+  }
+
+  .field-hint {
+    @apply mt-1.5 text-xs text-slate-500;
+  }
+
+  .field-error {
+    @apply mt-1.5 flex items-start gap-1.5 text-xs font-medium text-red-600;
+  }
+
+  .card {
+    @apply rounded-2xl border border-slate-200 bg-white shadow-[var(--shadow-card)];
+  }
+
+  .btn-primary,
+  .btn-accent,
+  .btn-secondary,
+  .btn-ghost {
+    @apply inline-flex items-center justify-center gap-2 rounded-lg px-5 py-2.5 text-sm font-semibold
+      transition-all duration-150 focus-visible:outline-2 focus-visible:outline-offset-2
+      disabled:cursor-not-allowed disabled:opacity-50;
+  }
+
+  .btn-primary {
+    @apply bg-slate-900 text-white shadow-sm hover:bg-slate-800 focus-visible:outline-slate-900
+      active:bg-slate-950;
+  }
+
+  .btn-accent {
+    @apply bg-teal-700 text-white shadow-sm hover:bg-teal-800 focus-visible:outline-teal-700
+      active:bg-teal-900;
+  }
+
+  .btn-secondary {
+    @apply border border-slate-300 bg-white text-slate-700 hover:bg-slate-50
+      focus-visible:outline-slate-400;
+  }
+
+  .btn-ghost {
+    @apply text-slate-600 hover:bg-slate-100 focus-visible:outline-slate-400;
+  }
+}
