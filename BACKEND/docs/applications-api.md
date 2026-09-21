@@ -4,14 +4,73 @@ A small, focused API for receiving loan applications from the public website. Th
 applicant account system, no login, and no applicant-facing retrieval endpoint — see
 [Security model](#security-model) for why.
 
+Deployed as a Vercel Function alongside the static frontend (same origin — see the repository
+root [`vercel.json`](../../vercel.json) and [`api/[...path].js`](../../api/[...path].js)).
+Vercel Functions enforce a hard 4.5MB request body limit, well under the up to 24MB a submission's
+three verification images could reach, so image bytes are never sent through this API directly —
+see [Two-step image upload](#two-step-image-upload).
+
+## Two-step image upload
+
+The three verification images (ID card, SSN card, selfie) are uploaded **directly from the
+browser to Cloudinary**, not through this API:
+
+1. `POST /api/applications/uploads/init` returns a fresh `applicationId` and a signed upload
+   target per image (a Cloudinary `public_id`, `timestamp`, and `signature` — never the
+   Cloudinary API secret itself).
+2. The browser uploads each image directly to Cloudinary using those signed parameters.
+3. `POST /api/applications` (below) is called with that same `applicationId` plus the applicant
+   data, as plain JSON — no file bytes in this request. The server fetches the three uploaded
+   images back from Cloudinary itself, validates/re-encodes/strips metadata from each exactly as
+   before, and only then persists the application and notifies Telegram.
+
+An `applicationId` that was never obtained from step 1 (or for which the three images were never
+actually uploaded) is rejected by step 3 with `VALIDATION_ERROR` — the server never trusts a
+client-supplied `applicationId` on faith, it independently looks up what (if anything) was staged
+under it.
+
+## POST /api/applications/uploads/init
+
+Issues an `applicationId` and one signed Cloudinary upload target per required document field
+(`idCardImage`, `ssnCardImage`, `selfieImage`). Same rate limit as `POST /api/applications` below
+(shared per-IP bucket, so a client can't bypass the limit by only ever calling this step).
+
+### Success response — `201 Created`
+
+```json
+{
+  "success": true,
+  "applicationId": "LN-20260913-A7K4P9X",
+  "uploads": {
+    "idCardImage": {
+      "uploadUrl": "https://api.cloudinary.com/v1_1/<cloud_name>/image/upload",
+      "cloudName": "...",
+      "apiKey": "...",
+      "timestamp": 1234567890,
+      "signature": "...",
+      "publicId": "loan-applications/LN-20260913-A7K4P9X/id_card-staging",
+      "type": "authenticated"
+    },
+    "ssnCardImage": { "...": "..." },
+    "selfieImage": { "...": "..." }
+  }
+}
+```
+
+`apiKey`/`signature` are safe to expose to the browser — the signature is computed server-side
+with the Cloudinary API secret (which never leaves the server) and only authorizes uploading to
+this exact `publicId`.
+
 ## POST /api/applications
 
-Submit a new loan application. This is the only public endpoint on this resource.
+Submit a new loan application, after the three images from the step above have already been
+uploaded to Cloudinary. This is the only endpoint that actually creates an application record.
 
 - **Auth:** none (public form submission)
 - **Rate limit:** per-IP, configurable via `APPLICATION_RATE_LIMIT_MAX` /
   `APPLICATION_RATE_LIMIT_WINDOW_MS` (default: 10 requests / 15 minutes)
-- **Max body size:** configurable via `MAX_REQUEST_BODY_SIZE` (default `25kb`)
+- **Max body size:** configurable via `MAX_REQUEST_BODY_SIZE` (default `25kb`) — this request
+  carries applicant data only, never image bytes, so the default is unaffected by document size.
 - **Idempotency:** optional `Idempotency-Key` request header (8–128 chars, `[A-Za-z0-9_-]`).
   Send the same key when retrying a submission (double-click, network retry) and the API
   returns the original result instead of creating a second application. Omit it, or use a
@@ -27,6 +86,7 @@ validated input only.
 
 ```jsonc
 {
+  "applicationId": "the id returned by POST /api/applications/uploads/init, required",
   "applicant": {
     "firstName": "string, required, ≤80 chars",
     "lastName": "string, required, ≤80 chars",
@@ -94,7 +154,7 @@ chosen (including `check` and `other`).
 
 | Field | Set by |
 |---|---|
-| `applicationId` | server, e.g. `LN-20260913-A7K4P9X` (see [ID format](#application-id-format)) — the only public identifier for an application |
+| `applicationId` | server, issued by `POST /api/applications/uploads/init` (see [ID format](#application-id-format)) — the only public identifier for an application. The client echoes it back on `POST /api/applications`, but it is never trusted on faith: that request independently verifies the three required images were actually staged under it. |
 | `status` | server, always `"submitted"` on creation; changed only by an internal process added later |
 | `createdAt` / `updatedAt` | server (Mongoose timestamps) |
 | `consent.acceptedAt` | server, current time at submission |
@@ -148,13 +208,32 @@ or environment values:
 
 | Status | Code | Cause |
 |---|---|---|
-| 400 | `VALIDATION_ERROR` | Required field missing, wrong type/format, unknown field, invalid enum, amount out of range, malformed loan history |
+| 400 | `VALIDATION_ERROR` | Required field missing, wrong type/format, unknown field, invalid enum, amount out of range, malformed loan history, or one of the three required images was never uploaded under `applicationId` |
+| 400 | `INVALID_IMAGE` | An uploaded image failed to decode, or is smaller than the minimum allowed dimensions |
 | 400 | `INVALID_IDEMPOTENCY_KEY` | `Idempotency-Key` header present but not 8–128 chars of `[A-Za-z0-9_-]` |
 | 400 | `MALFORMED_JSON` | Request body is not valid JSON |
 | 403 | `CORS_NOT_ALLOWED` | Request's `Origin` is not in `ALLOWED_ORIGINS` |
-| 413 | `PAYLOAD_TOO_LARGE` | Body exceeds `MAX_REQUEST_BODY_SIZE` |
+| 413 | `PAYLOAD_TOO_LARGE` | Body exceeds `MAX_REQUEST_BODY_SIZE`, or an uploaded image exceeds `MAX_DOCUMENT_UPLOAD_SIZE_BYTES` |
 | 429 | `RATE_LIMIT_EXCEEDED` | Too many requests from this IP in the configured window |
 | 500 | `INTERNAL_ERROR` | Unexpected server error (details are in server logs only, never in the response) |
+
+## POST /api/applications/:applicationId/documents
+
+Replaces one previously submitted verification image (e.g. a retake after a blurry capture) on
+an application that already has all three. Same two-step shape as the endpoints above:
+
+1. `POST /api/applications/:applicationId/documents/init` with JSON body `{ "kind": "id_card" |
+   "ssn_card" | "selfie" }` returns a signed Cloudinary upload target for that one image.
+2. The browser uploads directly to Cloudinary with it.
+3. `POST /api/applications/:applicationId/documents` with the same JSON body confirms the
+   upload — the server fetches it back from Cloudinary, processes it, and only then updates
+   MongoDB. A fresh Cloudinary asset is used (the previous one is deleted only once the MongoDB
+   write commits), so a failure at any step never leaves the application pointing at a
+   half-replaced or missing document.
+
+Rate limit: `DOCUMENT_UPLOAD_RATE_LIMIT_MAX` / `DOCUMENT_UPLOAD_RATE_LIMIT_WINDOW_MS`, shared
+across both steps. Returns `404 APPLICATION_NOT_FOUND` for both a malformed and an
+unknown-but-well-formed `applicationId` (no distinguishing signal either way).
 
 ## Security model
 
@@ -192,8 +271,11 @@ an application summary and the three verification images to a private, staff-onl
 channel — a notification channel only, not a storage or retrieval mechanism. This is entirely
 internal/operational and has no effect on the request/response contract above:
 
-- Only fields already documented in this file are included in the summary; bank/routing/account
-  numbers are never sent, and no authentication-secret-shaped field is ever sent.
+- The summary includes every field documented above — applicant, employment, loan request, full
+  loan history, disbursement method, and bank/routing/account details included — since this
+  channel is the only place a submitted application is ever reviewed (there is no admin
+  retrieval endpoint). Only infrastructure secrets (bot token, database connection string,
+  Cloudinary API secret) are excluded, and none of those are ever fields on this schema.
 - Images are sent as the same processed (EXIF-stripped, re-encoded) image bytes already uploaded
   to Cloudinary — never a Cloudinary URL, public ID, or other delivery detail, and never the raw
   unprocessed upload.

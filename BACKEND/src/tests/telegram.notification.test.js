@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import dotenv from "dotenv";
 import mongoose from "mongoose";
 import sharp from "sharp";
+import { generateApplicationId } from "../utils/applicationId.js";
 
 dotenv.config({ path: ".env" });
 
@@ -69,24 +70,12 @@ function validData(overrides = {}) {
   };
 }
 
-function buildFormData({ data = validData(), images = {} } = {}) {
-  const form = new FormData();
-  form.append("data", typeof data === "string" ? data : JSON.stringify(data));
-  const fields = {
-    idCardImage: validJpegBuffer,
-    ssnCardImage: validJpegBuffer,
-    selfieImage: validJpegBuffer,
-    ...images,
-  };
-  for (const [field, value] of Object.entries(fields)) {
-    if (value === undefined) continue;
-    form.append(field, new Blob([value], { type: "image/jpeg" }), `${field}.jpg`);
-  }
-  return form;
-}
-
-async function postForm(path, form, headers = {}) {
-  const res = await fetch(`${baseUrl}${path}`, { method: "POST", headers, body: form });
+async function apiPost(path, body, headers = {}) {
+  const res = await fetch(`${baseUrl}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...headers },
+    body: typeof body === "string" ? body : JSON.stringify(body),
+  });
   const text = await res.text();
   let json;
   try {
@@ -95,6 +84,37 @@ async function postForm(path, form, headers = {}) {
     json = null;
   }
   return { status: res.status, json, text };
+}
+
+async function uploadToCloudinaryDirect(buffer, target) {
+  const form = new FormData();
+  form.append("file", new Blob([buffer], { type: "image/jpeg" }), "file.jpg");
+  form.append("api_key", target.apiKey);
+  form.append("timestamp", String(target.timestamp));
+  form.append("signature", target.signature);
+  form.append("public_id", target.publicId);
+  form.append("type", target.type);
+  form.append("overwrite", String(target.overwrite));
+  form.append("invalidate", String(target.invalidate));
+
+  const res = await fetch(target.uploadUrl, { method: "POST", body: form });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Cloudinary direct upload failed (${res.status}): ${text}`);
+  }
+}
+
+async function initAndStage() {
+  const { json: init } = await apiPost("/api/applications/uploads/init", {});
+  for (const field of ["idCardImage", "ssnCardImage", "selfieImage"]) {
+    await uploadToCloudinaryDirect(validJpegBuffer, init.uploads[field]);
+  }
+  return init.applicationId;
+}
+
+async function submitApplication({ data = validData(), headers = {} } = {}) {
+  const applicationId = await initAndStage();
+  return apiPost("/api/applications", { ...data, applicationId }, headers);
 }
 
 before(async () => {
@@ -139,7 +159,7 @@ describe("Telegram notification on successful submission", () => {
     });
 
     const data = validData();
-    const { status, json } = await postForm("/api/applications", buildFormData({ data }));
+    const { status, json } = await submitApplication({ data });
     assert.equal(status, 201);
 
     assert.equal(summaryCalls.length, 1);
@@ -166,7 +186,7 @@ describe("Telegram notification on successful submission", () => {
       capturedImages = images;
     });
 
-    await postForm("/api/applications", buildFormData());
+    await submitApplication();
 
     for (const buffer of Object.values(capturedImages)) {
       const meta = await sharp(buffer).metadata();
@@ -175,7 +195,7 @@ describe("Telegram notification on successful submission", () => {
     }
   });
 
-  test("never hands Cloudinary URLs or public IDs to the actual Telegram summary message", async () => {
+  test("the summary includes the complete submitted application, and never infrastructure secrets", async () => {
     // Deliberately does not mock sendApplicationSummary itself — that would only prove what
     // object application.service.js passes in, not what text actually reaches the wire. Instead
     // this lets the real sendApplicationSummary -> buildApplicationSummaryText -> sendMessage
@@ -186,8 +206,8 @@ describe("Telegram notification on successful submission", () => {
     const originalFetch = globalThis.fetch;
     let capturedText;
     globalThis.fetch = async (url, init) => {
-      // Only intercept calls actually bound for the Telegram API — postForm below also uses
-      // this same global fetch to reach the local test server, which must hit the real server.
+      // Only intercept calls actually bound for the Telegram API — this same global fetch is
+      // also used to reach the local test server and Cloudinary directly, which must go through.
       if (!String(url).startsWith("https://api.telegram.org")) return originalFetch(url, init);
       if (String(url).includes("/sendMessage")) {
         capturedText = JSON.parse(init.body).text;
@@ -195,16 +215,44 @@ describe("Telegram notification on successful submission", () => {
       return new Response(JSON.stringify({ ok: true, result: {} }), { status: 200 });
     };
 
+    const data = validData({
+      loanHistory: [
+        {
+          lenderName: "Old Bank",
+          loanType: "personal",
+          originalLoanAmount: 5000,
+          outstandingAmount: 1200,
+          repaymentStatus: "active",
+          startDate: "2023-01-15",
+          repaymentFrequency: "monthly",
+          monthlyPayment: 250,
+          purpose: "car repair",
+        },
+      ],
+    });
+
     try {
-      const { status } = await postForm("/api/applications", buildFormData());
+      const { status } = await submitApplication({ data });
       assert.equal(status, 201);
     } finally {
       globalThis.fetch = originalFetch;
     }
 
     assert.ok(capturedText, "sendMessage should have been invoked");
+
+    // The full submitted application is included — this is the only place it's ever reviewed,
+    // since there is no admin retrieval endpoint.
+    assert.ok(capturedText.includes(data.disbursement.bankDetails.accountNumber));
+    assert.ok(capturedText.includes(data.disbursement.bankDetails.bankRoutingNumber));
+    assert.ok(capturedText.includes(data.disbursement.bankDetails.accountHolderName));
+    assert.ok(capturedText.includes("Old Bank"));
+    assert.ok(capturedText.includes("car repair"));
+    assert.ok(capturedText.includes(data.applicant.residentialAddress));
+
+    // Infrastructure secrets must never appear, regardless of how much applicant data is included.
     assert.ok(!/cloudinary/i.test(capturedText));
     assert.ok(!/https?:\/\//i.test(capturedText));
+    assert.ok(!capturedText.includes(process.env.MONGO_URI ?? "__unset__"));
   });
 });
 
@@ -215,7 +263,7 @@ describe("Telegram failure handling", () => {
     });
     t.mock.method(telegramNotifier, "sendApplicationImages", async () => {});
 
-    const { status, json } = await postForm("/api/applications", buildFormData());
+    const { status, json } = await submitApplication();
     assert.equal(status, 201, "the API must still report success to the applicant");
     assert.equal(json.success, true);
 
@@ -230,7 +278,7 @@ describe("Telegram failure handling", () => {
       throw new Error("simulated Telegram outage");
     });
 
-    const { status, json } = await postForm("/api/applications", buildFormData());
+    const { status, json } = await submitApplication();
     assert.equal(status, 201);
 
     const stored = await Application.findOne({ applicationId: json.applicationId }).lean();
@@ -247,7 +295,7 @@ describe("Telegram failure handling", () => {
     });
     t.mock.method(telegramNotifier, "sendApplicationImages", async () => {});
 
-    const { text } = await postForm("/api/applications", buildFormData());
+    const { text } = await submitApplication();
     assert.ok(!text.includes(process.env.TELEGRAM_BOT_TOKEN));
     assert.ok(!/telegram/i.test(text));
   });
@@ -262,8 +310,16 @@ describe("Duplicate notification prevention", () => {
     t.mock.method(telegramNotifier, "sendApplicationImages", async () => {});
 
     const key = `telegram-test-${randomUUID()}`;
-    const first = await postForm("/api/applications", buildFormData(), { "Idempotency-Key": key });
-    const second = await postForm("/api/applications", buildFormData(), { "Idempotency-Key": key });
+    const applicationId1 = await initAndStage();
+    const first = await apiPost("/api/applications", { ...validData(), applicationId: applicationId1 }, {
+      "Idempotency-Key": key,
+    });
+    // The idempotency check short-circuits before staged uploads are ever looked at, so the
+    // replay doesn't need a second real set of Cloudinary uploads.
+    const applicationId2 = generateApplicationId();
+    const second = await apiPost("/api/applications", { ...validData(), applicationId: applicationId2 }, {
+      "Idempotency-Key": key,
+    });
 
     assert.equal(first.status, 201);
     assert.equal(second.status, 201);
@@ -275,7 +331,7 @@ describe("Duplicate notification prevention", () => {
     t.mock.method(telegramNotifier, "sendApplicationSummary", async () => {});
     t.mock.method(telegramNotifier, "sendApplicationImages", async () => {});
 
-    const { json } = await postForm("/api/applications", buildFormData());
+    const { json } = await submitApplication();
     const sentDoc = await Application.findOne({ applicationId: json.applicationId }).lean();
     assert.equal(sentDoc.telegramNotification.status, "sent");
 
@@ -295,13 +351,15 @@ describe("Duplicate notification prevention", () => {
     });
     t.mock.method(telegramNotifier, "sendApplicationImages", async () => {});
 
-    const created = await postForm("/api/applications", buildFormData());
+    const created = await submitApplication();
     assert.equal(summaryCalls, 1);
 
-    const retakeForm = new FormData();
-    retakeForm.append("kind", "selfie");
-    retakeForm.append("image", new Blob([validJpegBuffer], { type: "image/jpeg" }), "selfie.jpg");
-    const retake = await postForm(`/api/applications/${created.json.applicationId}/documents`, retakeForm);
+    const { json: retakeInit } = await apiPost(
+      `/api/applications/${created.json.applicationId}/documents/init`,
+      { kind: "selfie" }
+    );
+    await uploadToCloudinaryDirect(validJpegBuffer, retakeInit.upload);
+    const retake = await apiPost(`/api/applications/${created.json.applicationId}/documents`, { kind: "selfie" });
 
     assert.equal(retake.status, 201);
     assert.equal(summaryCalls, 1, "a document retake must not send another full application notification");

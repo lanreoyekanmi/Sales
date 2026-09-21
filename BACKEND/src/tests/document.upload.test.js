@@ -78,23 +78,18 @@ function validData() {
   };
 }
 
-function buildApplicationForm() {
-  const form = new FormData();
-  form.append("data", JSON.stringify(validData()));
-  for (const field of ["idCardImage", "ssnCardImage", "selfieImage"]) {
-    form.append(field, new Blob([validJpegBuffer], { type: "image/jpeg" }), `${field}.jpg`);
-  }
-  return form;
-}
-
 // The Cloudinary Node SDK rejects with a plain object, not an Error instance — the real
 // message lives at err.error.message/err.error.http_code, not err.message.
 function isCloudinaryNotFound(err) {
   return err?.error?.http_code === 404;
 }
 
-async function postForm(path, form) {
-  const res = await fetch(`${baseUrl}${path}`, { method: "POST", body: form });
+async function apiPost(path, body, headers = {}) {
+  const res = await fetch(`${baseUrl}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...headers },
+    body: typeof body === "string" ? body : JSON.stringify(body),
+  });
   const text = await res.text();
   let json;
   try {
@@ -105,16 +100,59 @@ async function postForm(path, form) {
   return { status: res.status, json, text };
 }
 
-// Pass `null` (not `undefined`) to deliberately omit a field — default-parameter destructuring
-// would otherwise replace an explicit `undefined` with the default, defeating the "missing
-// field" test cases below.
-function buildDocumentForm(opts = {}) {
-  const kind = "kind" in opts ? opts.kind : "selfie";
-  const image = "image" in opts ? opts.image : validJpegBuffer;
+// Mirrors the real browser flow (see FRONTEND/src/api/applications.ts): upload the raw file
+// directly to Cloudinary using a signed target obtained from our own API.
+async function uploadToCloudinaryDirect(buffer, target) {
   const form = new FormData();
-  if (kind !== null) form.append("kind", kind);
-  if (image !== null) form.append("image", new Blob([image], { type: "image/jpeg" }), "image.jpg");
-  return form;
+  form.append("file", new Blob([buffer], { type: "image/jpeg" }), "file.jpg");
+  form.append("api_key", target.apiKey);
+  form.append("timestamp", String(target.timestamp));
+  form.append("signature", target.signature);
+  form.append("public_id", target.publicId);
+  form.append("type", target.type);
+  form.append("overwrite", String(target.overwrite));
+  form.append("invalidate", String(target.invalidate));
+
+  const res = await fetch(target.uploadUrl, { method: "POST", body: form });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Cloudinary direct upload failed (${res.status}): ${text}`);
+  }
+}
+
+async function initAndStageApplication() {
+  const { json: init } = await apiPost("/api/applications/uploads/init", {});
+  for (const field of ["idCardImage", "ssnCardImage", "selfieImage"]) {
+    await uploadToCloudinaryDirect(validJpegBuffer, init.uploads[field]);
+  }
+  return init.applicationId;
+}
+
+async function createApplication() {
+  const id = await initAndStageApplication();
+  const { json } = await apiPost("/api/applications", { ...validData(), applicationId: id });
+  return json.applicationId;
+}
+
+// Step 1 of a retake: returns the init response's `upload` target (or the full response, for
+// tests that expect init itself to fail). `image: null` deliberately skips the real Cloudinary
+// upload — simulates "the client called init but never actually uploaded anything".
+async function stageRetake(id, kind, image = validJpegBuffer) {
+  const initRes = await apiPost(`/api/applications/${id}/documents/init`, { kind });
+  if (initRes.status === 201 && image !== null) {
+    await uploadToCloudinaryDirect(image, initRes.json.upload);
+  }
+  return initRes;
+}
+
+function confirmRetake(id, kind) {
+  return apiPost(`/api/applications/${id}/documents`, { kind });
+}
+
+async function retakeDocument(id, { kind = "selfie", image = validJpegBuffer } = {}) {
+  const initRes = await stageRetake(id, kind, image);
+  if (initRes.status !== 201) return initRes;
+  return confirmRetake(id, kind);
 }
 
 before(async () => {
@@ -139,8 +177,7 @@ before(async () => {
   await new Promise((resolve) => server.once("listening", resolve));
   baseUrl = `http://127.0.0.1:${server.address().port}`;
 
-  const created = await postForm("/api/applications", buildApplicationForm());
-  applicationId = created.json.applicationId;
+  applicationId = await createApplication();
 });
 
 after(async () => {
@@ -153,10 +190,7 @@ after(async () => {
 
 describe("POST /api/applications/:applicationId/documents", () => {
   test("replaces an existing document of the given kind rather than duplicating it", async () => {
-    const { status, json } = await postForm(
-      `/api/applications/${applicationId}/documents`,
-      buildDocumentForm({ kind: "selfie" })
-    );
+    const { status, json } = await retakeDocument(applicationId, { kind: "selfie" });
     assert.equal(status, 201);
     assert.equal(json.success, true);
     assert.equal(json.kind, "selfie");
@@ -174,10 +208,7 @@ describe("POST /api/applications/:applicationId/documents", () => {
     const before = await Application.findOne({ applicationId }).select("+documents.publicId").lean();
     const previousPublicId = before.documents.find((d) => d.kind === "id_card").publicId;
 
-    const { status } = await postForm(
-      `/api/applications/${applicationId}/documents`,
-      buildDocumentForm({ kind: "id_card" })
-    );
+    const { status } = await retakeDocument(applicationId, { kind: "id_card" });
     assert.equal(status, 201);
 
     const after = await Application.findOne({ applicationId }).select("+documents.publicId").lean();
@@ -195,6 +226,8 @@ describe("POST /api/applications/:applicationId/documents", () => {
     const before = await Application.findOne({ applicationId }).select("+documents.publicId").lean();
     const previousDoc = before.documents.find((d) => d.kind === "selfie");
 
+    await stageRetake(applicationId, "selfie");
+
     let uploadedPublicId;
     const realUpload = cloudinaryStorage.uploadDocumentFile.bind(cloudinaryStorage);
     t.mock.method(cloudinaryStorage, "uploadDocumentFile", async (args) => {
@@ -206,10 +239,7 @@ describe("POST /api/applications/:applicationId/documents", () => {
       throw new Error("simulated MongoDB outage");
     });
 
-    const { status, json } = await postForm(
-      `/api/applications/${applicationId}/documents`,
-      buildDocumentForm({ kind: "selfie" })
-    );
+    const { status, json } = await confirmRetake(applicationId, "selfie");
     assert.equal(status, 500);
     assert.equal(json.code, "INTERNAL_ERROR");
     assert.ok(!("stack" in json));
@@ -238,72 +268,62 @@ describe("POST /api/applications/:applicationId/documents", () => {
       .jpeg()
       .toBuffer();
 
-    const { status, json } = await postForm(
-      `/api/applications/${applicationId}/documents`,
-      buildDocumentForm({ image: tiny })
-    );
+    const { status, json } = await retakeDocument(applicationId, { kind: "selfie", image: tiny });
     assert.equal(status, 400);
     assert.equal(json.code, "INVALID_IMAGE");
   });
 
   test("rejects an invalid kind", async () => {
-    const { status, json } = await postForm(
-      `/api/applications/${applicationId}/documents`,
-      buildDocumentForm({ kind: "passport" })
-    );
+    const { status, json } = await apiPost(`/api/applications/${applicationId}/documents/init`, { kind: "passport" });
     assert.equal(status, 400);
     assert.equal(json.code, "VALIDATION_ERROR");
   });
 
-  test("rejects a request with no image file", async () => {
-    const { status, json } = await postForm(
-      `/api/applications/${applicationId}/documents`,
-      buildDocumentForm({ image: null })
-    );
+  test("rejects a request with no image ever uploaded", async () => {
+    const { status, json } = await retakeDocument(applicationId, { kind: "selfie", image: null });
     assert.equal(status, 400);
     assert.equal(json.code, "VALIDATION_ERROR");
   });
 
-  test("rejects a non-image file disguised as an image", async () => {
-    const { status, json } = await postForm(
-      `/api/applications/${applicationId}/documents`,
-      buildDocumentForm({ image: Buffer.from("not an image") })
-    );
+  test("rejects a non-image file disguised as an image", async (t) => {
+    await apiPost(`/api/applications/${applicationId}/documents/init`, { kind: "selfie" });
+    t.mock.method(cloudinaryStorage, "fetchStagedUpload", async () => ({
+      buffer: Buffer.from("not an image"),
+      bytes: 13,
+    }));
+
+    const { status, json } = await confirmRetake(applicationId, "selfie");
     assert.equal(status, 400);
     assert.equal(json.code, "INVALID_IMAGE");
   });
 
-  test("rejects an oversized image", async () => {
-    const { status } = await postForm(
-      `/api/applications/${applicationId}/documents`,
-      buildDocumentForm({ image: Buffer.alloc(9 * 1024 * 1024, 0xff) })
-    );
+  test("rejects an oversized image", async (t) => {
+    await apiPost(`/api/applications/${applicationId}/documents/init`, { kind: "selfie" });
+    t.mock.method(cloudinaryStorage, "fetchStagedUpload", async () => ({
+      buffer: Buffer.alloc(1024, 0xff),
+      bytes: 9 * 1024 * 1024,
+    }));
+
+    const { status } = await confirmRetake(applicationId, "selfie");
     assert.equal(status, 413);
   });
 
   test("returns 404 for a well-formed but unknown applicationId", async () => {
-    const { status, json } = await postForm(
-      `/api/applications/${randomUUID()}/documents`,
-      buildDocumentForm()
-    );
+    const { status, json } = await apiPost(`/api/applications/${randomUUID()}/documents/init`, { kind: "selfie" });
     assert.equal(status, 404);
     assert.equal(json.code, "APPLICATION_NOT_FOUND");
   });
 
   test("returns the same 404 for a malformed applicationId (no distinguishing signal)", async () => {
-    const { status, json } = await postForm(
-      `/api/applications/not-a-uuid/documents`,
-      buildDocumentForm()
-    );
+    const { status, json } = await apiPost("/api/applications/not-a-uuid/documents/init", { kind: "selfie" });
     assert.equal(status, 404);
     assert.equal(json.code, "APPLICATION_NOT_FOUND");
   });
 
   test("returns 404 for a well-formed but unknown applicationId in the current LN- format", async () => {
-    const { status, json } = await postForm(
-      `/api/applications/${generateApplicationId()}/documents`,
-      buildDocumentForm()
-    );
+    const { status, json } = await apiPost(`/api/applications/${generateApplicationId()}/documents/init`, {
+      kind: "selfie",
+    });
     assert.equal(status, 404);
     assert.equal(json.code, "APPLICATION_NOT_FOUND");
   });
@@ -354,10 +374,7 @@ describe("POST /api/applications/:applicationId/documents", () => {
       metadata: {},
     }).save();
 
-    const { status, json } = await postForm(
-      `/api/applications/${legacyId}/documents`,
-      buildDocumentForm({ kind: "selfie" })
-    );
+    const { status, json } = await retakeDocument(legacyId, { kind: "selfie" });
     assert.equal(status, 201);
     assert.equal(json.success, true);
 

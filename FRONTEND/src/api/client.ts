@@ -47,11 +47,11 @@ export interface RequestOptions {
 }
 
 /**
- * POSTs a FormData body and returns the parsed JSON body on success. Throws
- * ApplicationApiError for every failure mode (network, timeout, non-2xx, unexpected shape) with
- * a message that is always safe to render to the applicant.
+ * POSTs a JSON body and returns the parsed JSON body on success. Throws ApplicationApiError for
+ * every failure mode (network, timeout, non-2xx, unexpected shape) with a message that is
+ * always safe to render to the applicant.
  */
-export async function postForm<T>(path: string, body: FormData, options: RequestOptions = {}): Promise<T> {
+export async function postJson<T>(path: string, body: unknown, options: RequestOptions = {}): Promise<T> {
   if (!API_BASE_URL) {
     throw new ApplicationApiError(
       "This application isn't configured correctly. Please try again later.",
@@ -72,11 +72,11 @@ export async function postForm<T>(path: string, body: FormData, options: Request
   try {
     res = await fetch(`${API_BASE_URL}${path}`, {
       method: "POST",
-      body,
+      body: JSON.stringify(body),
       // Never cache a submission request/response — it carries sensitive applicant data.
       cache: "no-store",
       credentials: "omit",
-      headers: options.headers,
+      headers: { ...options.headers, "Content-Type": "application/json" },
       signal: controller.signal,
     });
   } catch (err) {

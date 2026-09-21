@@ -37,32 +37,6 @@ export default function errorHandler(err, req, res, _next) {
     });
   }
 
-  // multer surfaces upload problems (oversized file, wrong field name, too many files) as a
-  // MulterError rather than an ApiError; fileFilter rejections surface as the plain Error it
-  // was constructed with below.
-  if (err?.name === "MulterError") {
-    if (err.code === "LIMIT_FILE_SIZE") {
-      return res.status(413).json({
-        success: false,
-        message: "Uploaded file is too large.",
-        code: "PAYLOAD_TOO_LARGE",
-      });
-    }
-    return res.status(400).json({
-      success: false,
-      message: "Invalid file upload.",
-      code: "VALIDATION_ERROR",
-    });
-  }
-
-  if (err?.message === "UNSUPPORTED_FILE_TYPE") {
-    return res.status(400).json({
-      success: false,
-      message: "Only JPEG, PNG, or WEBP images are accepted.",
-      code: "VALIDATION_ERROR",
-    });
-  }
-
   if (err?.message === "Not allowed by CORS") {
     logger.warn("cors_rejected", { requestId, origin: req.headers.origin });
     return res.status(403).json({

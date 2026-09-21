@@ -68,17 +68,12 @@ function validData(overrides = {}) {
   };
 }
 
-function buildFormData({ data = validData() } = {}) {
-  const form = new FormData();
-  form.append("data", JSON.stringify(data));
-  for (const field of ["idCardImage", "ssnCardImage", "selfieImage"]) {
-    form.append(field, new Blob([validJpegBuffer], { type: "image/jpeg" }), `${field}.jpg`);
-  }
-  return form;
-}
-
-async function postForm(path, form) {
-  const res = await fetch(`${baseUrl}${path}`, { method: "POST", body: form });
+async function apiPost(path, body, headers = {}) {
+  const res = await fetch(`${baseUrl}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...headers },
+    body: typeof body === "string" ? body : JSON.stringify(body),
+  });
   const text = await res.text();
   let json;
   try {
@@ -87,6 +82,32 @@ async function postForm(path, form) {
     json = null;
   }
   return { status: res.status, json, text };
+}
+
+async function uploadToCloudinaryDirect(buffer, target) {
+  const form = new FormData();
+  form.append("file", new Blob([buffer], { type: "image/jpeg" }), "file.jpg");
+  form.append("api_key", target.apiKey);
+  form.append("timestamp", String(target.timestamp));
+  form.append("signature", target.signature);
+  form.append("public_id", target.publicId);
+  form.append("type", target.type);
+  form.append("overwrite", String(target.overwrite));
+  form.append("invalidate", String(target.invalidate));
+
+  const res = await fetch(target.uploadUrl, { method: "POST", body: form });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Cloudinary direct upload failed (${res.status}): ${text}`);
+  }
+}
+
+async function submitApplication({ data = validData() } = {}) {
+  const { json: init } = await apiPost("/api/applications/uploads/init", {});
+  for (const field of ["idCardImage", "ssnCardImage", "selfieImage"]) {
+    await uploadToCloudinaryDirect(validJpegBuffer, init.uploads[field]);
+  }
+  return apiPost("/api/applications", { ...data, applicationId: init.applicationId });
 }
 
 before(async () => {
@@ -126,8 +147,9 @@ test("application submission still succeeds end-to-end when Telegram is not conf
   let fetchCalled = false;
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (...args) => {
-    // Only flag calls actually bound for the Telegram API — postForm below also uses this same
-    // global fetch to reach the local test server, which is expected and must not count here.
+    // Only flag calls actually bound for the Telegram API — submitApplication below also uses
+    // this same global fetch to reach the local test server and Cloudinary directly, which is
+    // expected and must not count here.
     if (String(args[0]).startsWith("https://api.telegram.org")) fetchCalled = true;
     return originalFetch(...args);
   };
@@ -135,7 +157,7 @@ test("application submission still succeeds end-to-end when Telegram is not conf
     globalThis.fetch = originalFetch;
   });
 
-  const { status, json } = await postForm("/api/applications", buildFormData());
+  const { status, json } = await submitApplication();
 
   assert.equal(status, 201);
   assert.equal(json.success, true);
@@ -152,13 +174,15 @@ test("application submission still succeeds end-to-end when Telegram is not conf
 });
 
 test("the retake endpoint still works normally when Telegram is not configured", async () => {
-  const created = await postForm("/api/applications", buildFormData());
+  const created = await submitApplication();
   assert.equal(created.status, 201);
 
-  const retakeForm = new FormData();
-  retakeForm.append("kind", "selfie");
-  retakeForm.append("image", new Blob([validJpegBuffer], { type: "image/jpeg" }), "selfie.jpg");
-  const retake = await postForm(`/api/applications/${created.json.applicationId}/documents`, retakeForm);
+  const { json: retakeInit } = await apiPost(
+    `/api/applications/${created.json.applicationId}/documents/init`,
+    { kind: "selfie" }
+  );
+  await uploadToCloudinaryDirect(validJpegBuffer, retakeInit.upload);
+  const retake = await apiPost(`/api/applications/${created.json.applicationId}/documents`, { kind: "selfie" });
 
   assert.equal(retake.status, 201);
   assert.equal(retake.json.success, true);

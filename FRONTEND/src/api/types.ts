@@ -12,6 +12,37 @@ export interface ApplicationSuccessResponse {
   applicationId: string;
 }
 
+// A signed direct-to-Cloudinary upload target, returned by
+// POST /api/applications/uploads/init and POST /api/applications/:id/documents/init. Contains
+// no secret — `signature` is computed server-side with the Cloudinary API secret, which never
+// leaves the server.
+export interface CloudinaryUploadTarget {
+  uploadUrl: string;
+  cloudName: string;
+  apiKey: string;
+  timestamp: number;
+  signature: string;
+  publicId: string;
+  type: string;
+  overwrite: boolean;
+  invalidate: boolean;
+}
+
+export interface ApplicationUploadInitResponse {
+  success: true;
+  applicationId: string;
+  uploads: {
+    idCardImage: CloudinaryUploadTarget;
+    ssnCardImage: CloudinaryUploadTarget;
+    selfieImage: CloudinaryUploadTarget;
+  };
+}
+
+export interface DocumentUploadInitResponse {
+  success: true;
+  upload: CloudinaryUploadTarget;
+}
+
 export interface ApplicationErrorResponse {
   success: false;
   message: string;
@@ -29,6 +60,7 @@ export type ApiErrorCode =
   | "INTERNAL_ERROR"
   | "NETWORK_ERROR"
   | "TIMEOUT"
+  | "UPLOAD_FAILED"
   | "UNEXPECTED_RESPONSE";
 
 // Thrown by the API client for every failure mode: server-reported errors (parsed defensively

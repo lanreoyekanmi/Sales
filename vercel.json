@@ -1,0 +1,6 @@
+{
+  "installCommand": "npm install --prefix BACKEND && npm install --prefix FRONTEND",
+  "buildCommand": "npm run build --prefix FRONTEND",
+  "outputDirectory": "FRONTEND/dist",
+  "rewrites": [{ "source": "/((?!api/).*)", "destination": "/index.html" }]
+}

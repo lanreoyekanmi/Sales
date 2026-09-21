@@ -1,9 +1,8 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import dotenv from "dotenv";
+import mongoose from "mongoose";
 
-// This file never touched Mongo before, so it never needed this — but app.js now transitively
-// imports config/cloudinary.js, which throws if its required env vars aren't loaded yet.
 dotenv.config({ path: ".env" });
 
 // Node's test runner executes each test file in its own process, so mutating these env vars
@@ -13,12 +12,27 @@ process.env.APPLICATION_RATE_LIMIT_WINDOW_MS = "60000";
 process.env.DOCUMENT_UPLOAD_RATE_LIMIT_MAX = "3";
 process.env.DOCUMENT_UPLOAD_RATE_LIMIT_WINDOW_MS = "60000";
 
+// The rate limiter is backed by MongoDB (see middleware/mongoRateLimiter.js) so the limit is
+// enforced correctly across concurrent Vercel Function instances, which don't share process
+// memory the way a single long-running server does — this file needs its own DB connection now.
+const TEST_DB_NAME = "Sales_test_rate_limiter";
+
 let server;
 let baseUrl;
 
 before(async () => {
-  // Rate limiting runs before body validation, so a trivially invalid body is enough here —
-  // this test never needs a database connection.
+  if (!process.env.MONGO_URI) {
+    throw new Error("MONGO_URI must be set (see .env.example) to run rateLimiter.test.js");
+  }
+  await mongoose.connect(process.env.MONGO_URI, { dbName: TEST_DB_NAME });
+
+  // Start from a clean slate: a counter from a previous run of this same file within the same
+  // fixed time window (unlike the old in-memory store, a MongoDB-backed one persists across
+  // process runs until its TTL expires) would otherwise make these count-based assertions flaky.
+  const { default: RateLimitHit } = await import("../models/rateLimitHit.model.js");
+  await RateLimitHit.deleteMany({});
+
+  // Rate limiting runs before body validation, so a trivially invalid body is enough here.
   const { default: app } = await import("../app.js");
   server = app.listen(0);
   await new Promise((resolve) => server.once("listening", resolve));
@@ -26,6 +40,9 @@ before(async () => {
 });
 
 after(async () => {
+  const { default: RateLimitHit } = await import("../models/rateLimitHit.model.js");
+  await RateLimitHit.deleteMany({});
+  await mongoose.disconnect();
   await new Promise((resolve) => server.close(resolve));
 });
 
@@ -53,8 +70,7 @@ test("the document upload endpoint is rate limited per IP, independently of the 
   const responses = [];
 
   for (let i = 0; i < max + 2; i++) {
-    // Rate limiting runs before multer/validation, so a body that isn't even valid
-    // multipart is enough here — this test never needs a database connection.
+    // Rate limiting runs before validation, so a trivial body is enough here.
     const res = await fetch(`${baseUrl}/api/applications/${"0".repeat(36)}/documents`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },

@@ -110,16 +110,41 @@ function formatLine(label, value) {
 
 const SECTION_RULE = "━".repeat(18); // "━━━━━━━━━━━━━━━━━━"
 
-// Builds the Telegram-bound application summary directly from the saved application document,
-// listing only fields that exist on the application schema. Deliberately excludes
-// `disbursement`/`bankDetails` entirely (routing/account numbers are the most sensitive fields
-// this API stores — see docs/applications-api.md) and every authentication-secret-shaped field
-// (there are none on this schema, but none should ever be added here either). Sent as plain
-// text with no parse_mode, so no Markdown/HTML escaping is needed or attempted.
+function formatBoolean(value) {
+  if (value === undefined || value === null) return "N/A";
+  return value ? "Yes" : "No";
+}
+
+function loanHistoryBlock(entry, index) {
+  return [
+    `Loan #${index + 1}`,
+    formatLine("  Lender", entry.lenderName),
+    formatLine("  Type", entry.loanType),
+    formatLine("  Original Amount", formatMoney(entry.originalLoanAmount)),
+    formatLine("  Outstanding Amount", formatMoney(entry.outstandingAmount)),
+    formatLine("  Status", entry.repaymentStatus),
+    formatLine("  Start Date", formatDate(entry.startDate)),
+    formatLine("  End Date", formatDate(entry.endDate)),
+    formatLine("  Repayment Frequency", entry.repaymentFrequency),
+    formatLine("  Monthly Payment", formatMoney(entry.monthlyPayment)),
+    formatLine("  Purpose", entry.purpose),
+  ].join("\n");
+}
+
+// Builds the Telegram-bound application summary directly from the saved application document.
+// Every applicant-submitted field is included, per operational requirement — this channel is
+// the only place the full application (including disbursement/bank details) is ever reviewed,
+// since there is no admin retrieval endpoint (see docs/applications-api.md). Only
+// infrastructure secrets (bot token, DB connection string, Cloudinary API secret) are excluded,
+// and none of those are ever fields on this schema in the first place. Sent as plain text with
+// no parse_mode, so no Markdown/HTML escaping is needed or attempted.
 export function buildApplicationSummaryText(doc) {
   const a = doc.applicant;
   const e = doc.employment;
   const l = doc.loanRequest;
+  const d = doc.disbursement;
+  const b = d?.bankDetails;
+  const c = doc.consent;
   const history = doc.loanHistory || [];
 
   const lines = [
@@ -130,6 +155,7 @@ export function buildApplicationSummaryText(doc) {
     SECTION_RULE,
     formatLine("Application ID", doc.applicationId),
     formatLine("Submitted", formatDate(doc.metadata?.submittedAt)),
+    formatLine("Status", doc.status),
     "",
     SECTION_RULE,
     "APPLICANT",
@@ -138,58 +164,63 @@ export function buildApplicationSummaryText(doc) {
     formatLine("Phone", a.phoneNumber),
     formatLine("Email", a.email),
     formatLine("Date of Birth", formatDate(a.dateOfBirth)),
-    formatLine("Address", `${a.residentialAddress}, ${a.city}, ${a.state}`),
+    formatLine("Gender", a.gender),
+    formatLine("Address", a.residentialAddress),
+    formatLine("City", a.city),
+    formatLine("State", a.state),
     "",
     SECTION_RULE,
     "EMPLOYMENT",
     SECTION_RULE,
     formatLine("Status", e.employmentStatus),
     formatLine("Employer", e.employerName),
-    formatLine("Occupation", e.jobTitle),
-    formatLine(
-      "Monthly Income",
-      e.monthlyIncome != null ? `${formatMoney(e.monthlyIncome)}${e.incomeFrequency ? ` (${e.incomeFrequency})` : ""}` : undefined
-    ),
+    formatLine("Job Title", e.jobTitle),
+    formatLine("Employment Duration", e.employmentDurationMonths != null ? `${e.employmentDurationMonths} months` : undefined),
+    formatLine("Monthly Income", formatMoney(e.monthlyIncome)),
+    formatLine("Income Frequency", e.incomeFrequency),
     "",
     SECTION_RULE,
-    "LOAN",
+    "LOAN REQUEST",
     SECTION_RULE,
-    formatLine("Amount Requested", formatMoney(l.requestedLoanAmount)),
+    formatLine("Requested Amount", formatMoney(l.requestedLoanAmount)),
     formatLine("Purpose", l.loanPurpose),
-    formatLine("Repayment Period", `${l.preferredRepaymentPeriodMonths} months (${l.repaymentFrequency})`),
+    formatLine("Repayment Period", `${l.preferredRepaymentPeriodMonths} months`),
+    formatLine("Repayment Frequency", l.repaymentFrequency),
     "",
     SECTION_RULE,
     "LOAN HISTORY",
     SECTION_RULE,
+    history.length === 0
+      ? formatLine("Previous Loans", "None declared")
+      : history.map(loanHistoryBlock).join("\n\n"),
+    "",
+    SECTION_RULE,
+    "DISBURSEMENT",
+    SECTION_RULE,
+    formatLine("Preferred Method", d?.preferredMethod),
+    formatLine("Other Method Details", d?.otherMethodDetails),
+    "",
+    formatLine("Account Holder Name", b?.accountHolderName),
+    formatLine("Bank Routing Number", b?.bankRoutingNumber),
+    formatLine("Account Number", b?.accountNumber),
+    formatLine("Account Type", b?.accountType),
+    formatLine("Bank Type", b?.bankType),
+    "",
+    SECTION_RULE,
+    "CONSENT",
+    SECTION_RULE,
+    formatLine("Terms Accepted", formatBoolean(c?.termsAccepted)),
+    formatLine("Data Processing Accepted", formatBoolean(c?.dataProcessingAccepted)),
   ];
-
-  if (history.length === 0) {
-    lines.push(formatLine("Previous Loan", "None declared"));
-  } else {
-    const [mostRecent] = history;
-    const suffix = history.length > 1 ? ` (+${history.length - 1} more)` : "";
-    lines.push(
-      formatLine("Previous Loan", `${mostRecent.lenderName}${suffix}`),
-      formatLine("Previous Loan Amount", formatMoney(mostRecent.originalLoanAmount)),
-      formatLine("Previous Loan Status", mostRecent.repaymentStatus),
-      formatLine("Previous Loan Date", formatDate(mostRecent.startDate))
-    );
-  }
-
-  lines.push(
-    "",
-    SECTION_RULE,
-    "DOCUMENTS",
-    SECTION_RULE,
-    "\u{1FAAA} ID Card",
-    "\u{1FAAA} SSN Card",
-    "\u{1F933} Selfie",
-    "",
-    "Status: Submitted"
-  );
 
   return lines.join("\n");
 }
+
+const DOCUMENT_IMAGE_CAPTION_EMOJI = {
+  id_card: "\u{1FAAA}", // 🪪
+  ssn_card: "\u{1F4B3}", // 💳
+  selfie: "\u{1F933}", // 🤳
+};
 
 // `images` is a { [kind]: Buffer } map of the same processed (EXIF-stripped, re-encoded)
 // buffers already uploaded to Cloudinary — never re-fetched from Cloudinary and never the
@@ -199,7 +230,8 @@ async function sendApplicationImages(applicationId, images) {
   for (const kind of DOCUMENT_KINDS) {
     const buffer = images[kind];
     if (!buffer) continue;
-    const caption = `${DOCUMENT_IMAGE_LABELS[kind] || kind}\nApplication ID: ${applicationId}`;
+    const emoji = DOCUMENT_IMAGE_CAPTION_EMOJI[kind] || "";
+    const caption = `${emoji} ${DOCUMENT_IMAGE_LABELS[kind] || kind}\nApplication ID: ${applicationId}`;
     await sendPhoto({ buffer, filename: `${kind}.jpg`, caption });
   }
 }

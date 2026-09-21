@@ -1,10 +1,11 @@
-import { postForm, type RequestOptions } from "./client";
-import type { ApplicationSuccessResponse } from "./types";
+import { postJson, type RequestOptions } from "./client";
+import { ApplicationApiError, type ApplicationSuccessResponse, type ApplicationUploadInitResponse, type CloudinaryUploadTarget } from "./types";
 import type { ApplicationFormValues } from "../lib/validation";
 
 // Exact JSON contract from BACKEND/docs/applications-api.md — every object is `.strict()` on
 // the server, so this must never include a field the backend schema doesn't declare.
 interface ApplicationSubmissionBody {
+  applicationId: string;
   applicant: {
     firstName: string;
     lastName: string;
@@ -62,8 +63,12 @@ interface ApplicationSubmissionBody {
 const emptyToUndefined = (v: string | undefined): string | undefined => (v ? v : undefined);
 
 /** Maps validated form state to the exact JSON contract the backend accepts (see docs). */
-export function buildApplicationSubmissionBody(values: ApplicationFormValues): ApplicationSubmissionBody {
+export function buildApplicationSubmissionBody(
+  values: ApplicationFormValues,
+  applicationId: string
+): ApplicationSubmissionBody {
   return {
+    applicationId,
     applicant: {
       firstName: values.applicant.firstName,
       lastName: values.applicant.lastName,
@@ -126,10 +131,48 @@ export interface VerificationFiles {
 }
 
 /**
- * Submits a new loan application. Builds the exact multipart/form-data contract the backend
- * expects: a single "data" field carrying the JSON payload, plus the three required image
- * parts under their exact field names. Do not set a Content-Type header here — the browser
- * must generate the multipart boundary itself.
+ * Uploads one file directly to Cloudinary using a signature obtained from our own API (see
+ * initUploads below) — the file never passes through our server. Required because a Vercel
+ * Function request body is capped at 4.5MB, well under the 8MB this app allows per image; the
+ * server fetches the uploaded bytes back from Cloudinary itself once POST /applications runs.
+ */
+async function uploadToCloudinary(file: File, target: CloudinaryUploadTarget): Promise<void> {
+  const form = new FormData();
+  form.append("file", file);
+  form.append("api_key", target.apiKey);
+  form.append("timestamp", String(target.timestamp));
+  form.append("signature", target.signature);
+  form.append("public_id", target.publicId);
+  form.append("type", target.type);
+  form.append("overwrite", String(target.overwrite));
+  form.append("invalidate", String(target.invalidate));
+
+  let res: Response;
+  try {
+    res = await fetch(target.uploadUrl, { method: "POST", body: form });
+  } catch {
+    throw new ApplicationApiError(
+      "We couldn't upload your documents. Please check your internet connection and try again.",
+      "UPLOAD_FAILED"
+    );
+  }
+  if (!res.ok) {
+    throw new ApplicationApiError("We couldn't upload your documents. Please try again.", "UPLOAD_FAILED");
+  }
+}
+
+/** Step 1: obtains a fresh applicationId and a signed Cloudinary upload target per document. */
+function initUploads(options?: RequestOptions): Promise<ApplicationUploadInitResponse> {
+  return postJson<ApplicationUploadInitResponse>("/applications/uploads/init", {}, options);
+}
+
+/**
+ * Submits a new loan application:
+ *  1. requests an applicationId + signed upload targets from our API,
+ *  2. uploads the three verification images directly to Cloudinary (bypassing our server),
+ *  3. POSTs the application data (plus the applicationId from step 1) as plain JSON.
+ * The backend fetches the uploaded images back from Cloudinary itself, so nothing here ever
+ * sends raw image bytes through our own API.
  */
 export async function submitApplication(
   values: ApplicationFormValues,
@@ -137,15 +180,17 @@ export async function submitApplication(
   idempotencyKey: string,
   options?: RequestOptions
 ): Promise<ApplicationSuccessResponse> {
-  const body = buildApplicationSubmissionBody(values);
+  const init = await initUploads(options);
 
-  const formData = new FormData();
-  formData.append("data", JSON.stringify(body));
-  formData.append("idCardImage", files.idCardImage);
-  formData.append("ssnCardImage", files.ssnCardImage);
-  formData.append("selfieImage", files.selfieImage);
+  await Promise.all([
+    uploadToCloudinary(files.idCardImage, init.uploads.idCardImage),
+    uploadToCloudinary(files.ssnCardImage, init.uploads.ssnCardImage),
+    uploadToCloudinary(files.selfieImage, init.uploads.selfieImage),
+  ]);
 
-  return postForm<ApplicationSuccessResponse>("/applications", formData, {
+  const body = buildApplicationSubmissionBody(values, init.applicationId);
+
+  return postJson<ApplicationSuccessResponse>("/applications", body, {
     ...options,
     headers: {
       ...options?.headers,

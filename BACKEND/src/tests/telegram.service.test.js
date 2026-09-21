@@ -39,12 +39,14 @@ function withEnv(vars, fn) {
 function fakeSavedApplication(overrides = {}) {
   return {
     applicationId: "LN-20260115-A7K4P9X",
+    status: "submitted",
     applicant: {
       firstName: "Jane",
       lastName: "Doe",
       email: "jane@example.com",
       phoneNumber: "+1 555-123-4567",
       dateOfBirth: new Date("1990-01-01"),
+      gender: "female",
       residentialAddress: "123 Main St",
       city: "Springfield",
       state: "IL",
@@ -53,6 +55,7 @@ function fakeSavedApplication(overrides = {}) {
       employmentStatus: "employed",
       employerName: "Acme Corp",
       jobTitle: "Engineer",
+      employmentDurationMonths: 36,
       monthlyIncome: { toString: () => "4500.00" },
       incomeFrequency: "monthly",
     },
@@ -73,8 +76,11 @@ function fakeSavedApplication(overrides = {}) {
         accountHolderName: "Jane Doe",
         bankRoutingNumber: "011401533",
         accountNumber: "999999999",
+        accountType: "checking",
+        bankType: "bank",
       },
     },
+    consent: { termsAccepted: true, dataProcessingAccepted: true },
     password: "shouldNeverAppear",
     passwordHash: "$2b$10$shouldNeverAppear",
     otp: "123456",
@@ -108,35 +114,45 @@ describe("telegramNotifier.isConfigured", () => {
 });
 
 describe("buildApplicationSummaryText", () => {
-  test("maps only genuine application-schema fields into the summary", () => {
+  test("maps every genuine application-schema field into the summary", () => {
     const text = buildApplicationSummaryText(fakeSavedApplication());
 
     assert.match(text, /Application ID: LN-20260115-A7K4P9X/);
+    assert.match(text, /Status: submitted/);
     assert.match(text, /Name: Jane Doe/);
     assert.match(text, /Phone: \+1 555-123-4567/);
     assert.match(text, /Email: jane@example\.com/);
-    assert.match(text, /Address: 123 Main St, Springfield, IL/);
+    assert.match(text, /Gender: female/);
+    assert.match(text, /Address: 123 Main St/);
+    assert.match(text, /City: Springfield/);
+    assert.match(text, /State: IL/);
     assert.match(text, /Status: employed/);
     assert.match(text, /Employer: Acme Corp/);
-    assert.match(text, /Monthly Income: 4500\.00 \(monthly\)/);
-    assert.match(text, /Amount Requested: 10000\.00/);
+    assert.match(text, /Job Title: Engineer/);
+    assert.match(text, /Employment Duration: 36 months/);
+    assert.match(text, /Monthly Income: 4500\.00/);
+    assert.match(text, /Income Frequency: monthly/);
+    assert.match(text, /Requested Amount: 10000\.00/);
     assert.match(text, /Purpose: Home renovation/);
-    assert.match(text, /Repayment Period: 24 months \(monthly\)/);
-    assert.match(text, /Previous Loan: None declared/);
-    assert.match(text, /ID Card/);
-    assert.match(text, /SSN Card/);
-    assert.match(text, /Selfie/);
-    assert.match(text, /Status: Submitted/);
+    assert.match(text, /Repayment Period: 24 months/);
+    assert.match(text, /Repayment Frequency: monthly/);
+    assert.match(text, /Previous Loans: None declared/);
   });
 
-  test("summarizes loan history to the most recent entry plus a count of the rest", () => {
+  test("includes every loan history record with every field, not just the most recent", () => {
     const doc = fakeSavedApplication({
       loanHistory: [
         {
           lenderName: "First Bank",
+          loanType: "personal",
           originalLoanAmount: { toString: () => "5000.00" },
+          outstandingAmount: { toString: () => "1000.00" },
           repaymentStatus: "paid",
           startDate: new Date("2020-01-01"),
+          endDate: new Date("2022-01-01"),
+          repaymentFrequency: "monthly",
+          monthlyPayment: { toString: () => "200.00" },
+          purpose: "debt consolidation",
         },
         {
           lenderName: "Second Bank",
@@ -148,9 +164,14 @@ describe("buildApplicationSummaryText", () => {
     });
     const text = buildApplicationSummaryText(doc);
 
-    assert.match(text, /Previous Loan: First Bank \(\+1 more\)/);
-    assert.match(text, /Previous Loan Amount: 5000\.00/);
-    assert.match(text, /Previous Loan Status: paid/);
+    assert.match(text, /Loan #1/);
+    assert.match(text, /Lender: First Bank/);
+    assert.match(text, /Original Amount: 5000\.00/);
+    assert.match(text, /Outstanding Amount: 1000\.00/);
+    assert.match(text, /Purpose: debt consolidation/);
+    assert.match(text, /Loan #2/);
+    assert.match(text, /Lender: Second Bank/);
+    assert.match(text, /Original Amount: 2000\.00/);
   });
 
   test("never includes authentication/security secrets even if present on the document", () => {
@@ -161,19 +182,28 @@ describe("buildApplicationSummaryText", () => {
       "$2b$10$shouldNeverAppear",
       "123456",
       "4321",
-      "999",
       "sk-shouldNeverAppear",
     ]) {
       assert.ok(!text.includes(secret), `summary must not contain secret value: ${secret}`);
     }
   });
 
-  test("never includes bank account/routing numbers or any disbursement field", () => {
+  test("includes disbursement method and bank details — this channel is the only place a submitted application is ever reviewed", () => {
     const text = buildApplicationSummaryText(fakeSavedApplication());
-    assert.ok(!text.includes("011401533"));
-    assert.ok(!text.includes("999999999"));
-    assert.ok(!/disbursement/i.test(text));
-    assert.ok(!/bank/i.test(text));
+    assert.match(text, /DISBURSEMENT/);
+    assert.match(text, /Preferred Method: direct_deposit/);
+    assert.match(text, /Account Holder Name: Jane Doe/);
+    assert.match(text, /Bank Routing Number: 011401533/);
+    assert.match(text, /Account Number: 999999999/);
+    assert.match(text, /Account Type: checking/);
+    assert.match(text, /Bank Type: bank/);
+  });
+
+  test("includes consent status", () => {
+    const text = buildApplicationSummaryText(fakeSavedApplication());
+    assert.match(text, /CONSENT/);
+    assert.match(text, /Terms Accepted: Yes/);
+    assert.match(text, /Data Processing Accepted: Yes/);
   });
 
   test("never includes Cloudinary URLs, public IDs, or delivery details", () => {
@@ -181,6 +211,12 @@ describe("buildApplicationSummaryText", () => {
     assert.ok(!/https?:\/\//i.test(text), "must not contain any URL");
     assert.ok(!/cloudinary/i.test(text));
     assert.ok(!text.includes("loan-applications/abc/id_card-xyz"));
+  });
+
+  test("never includes infrastructure secrets (bot token, DB URI, Cloudinary API secret shapes)", () => {
+    const text = buildApplicationSummaryText(fakeSavedApplication());
+    assert.ok(!/mongodb(\+srv)?:\/\//i.test(text));
+    assert.ok(!/TELEGRAM_BOT_TOKEN|CLOUDINARY_API_SECRET/i.test(text));
   });
 });
 
@@ -307,9 +343,9 @@ describe("telegramNotifier.sendApplicationImages", () => {
         assert.ok(!/cloudinary/i.test(caption));
         assert.ok(!/https?:\/\//i.test(caption));
       }
-      assert.ok(captions.some((c) => c.startsWith("ID CARD")));
-      assert.ok(captions.some((c) => c.startsWith("SSN CARD")));
-      assert.ok(captions.some((c) => c.startsWith("SELFIE")));
+      assert.ok(captions.some((c) => c.includes("ID CARD")));
+      assert.ok(captions.some((c) => c.includes("SSN CARD")));
+      assert.ok(captions.some((c) => c.includes("SELFIE")));
     }));
 
   test("skips a kind with no buffer instead of sending an empty photo", () =>

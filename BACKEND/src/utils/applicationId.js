@@ -7,7 +7,10 @@ const RANDOM_SEGMENT_LENGTH = 7;
 // between e.g. "0"/"O" is an acceptable trade-off against a larger, well-known alphabet.
 const RANDOM_SEGMENT_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
-const NEW_APPLICATION_ID_REGEX = new RegExp(
+// Exported so the request validator can accept exactly this shape for the `applicationId` a
+// client echoes back from POST /api/applications/uploads/init — never the legacy UUID shape,
+// which only ever originates server-side for applications created before this format existed.
+export const NEW_APPLICATION_ID_REGEX = new RegExp(
   `^${ID_PREFIX}-\\d{8}-[A-Z0-9]{${RANDOM_SEGMENT_LENGTH}}$`
 );
 // Applications created before this format existed already have a crypto.randomUUID() value

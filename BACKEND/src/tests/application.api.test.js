@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import dotenv from "dotenv";
 import mongoose from "mongoose";
 import sharp from "sharp";
+import { generateApplicationId } from "../utils/applicationId.js";
 
 dotenv.config({ path: ".env" });
 
@@ -79,34 +80,18 @@ function validData(overrides = {}) {
   };
 }
 
-// Builds the multipart/form-data body the real endpoint expects: a "data" JSON part plus the
-// three required image parts. Any of the three can be overridden/omitted to exercise
-// validation of the image requirement itself.
-function buildFormData({ data = validData(), images = {} } = {}) {
-  const form = new FormData();
-  form.append("data", typeof data === "string" ? data : JSON.stringify(data));
-
-  const fields = {
-    idCardImage: validJpegBuffer,
-    ssnCardImage: validJpegBuffer,
-    selfieImage: validJpegBuffer,
-    ...images,
-  };
-  for (const [field, value] of Object.entries(fields)) {
-    if (value === undefined) continue; // allows a test to omit a field entirely
-    form.append(field, new Blob([value], { type: "image/jpeg" }), `${field}.jpg`);
-  }
-  return form;
-}
-
 // The Cloudinary Node SDK rejects with a plain object, not an Error instance — the real
 // message lives at err.error.message/err.error.http_code, not err.message.
 function isCloudinaryNotFound(err) {
   return err?.error?.http_code === 404;
 }
 
-async function postForm(path, form, headers = {}) {
-  const res = await fetch(`${baseUrl}${path}`, { method: "POST", headers, body: form });
+async function apiPost(path, body, headers = {}) {
+  const res = await fetch(`${baseUrl}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...headers },
+    body: typeof body === "string" ? body : JSON.stringify(body),
+  });
   const text = await res.text();
   let json;
   try {
@@ -115,6 +100,58 @@ async function postForm(path, form, headers = {}) {
     json = null;
   }
   return { status: res.status, headers: res.headers, json, text };
+}
+
+// Uploads one file directly to Cloudinary using a signed target from
+// POST /api/applications/uploads/init — mirrors exactly what the real browser does (see
+// FRONTEND/src/api/applications.ts), so this stays a real integration test of the two-step
+// upload architecture, not a mock of it.
+async function uploadToCloudinaryDirect(buffer, target) {
+  const form = new FormData();
+  form.append("file", new Blob([buffer], { type: "image/jpeg" }), "file.jpg");
+  form.append("api_key", target.apiKey);
+  form.append("timestamp", String(target.timestamp));
+  form.append("signature", target.signature);
+  form.append("public_id", target.publicId);
+  form.append("type", target.type);
+  form.append("overwrite", String(target.overwrite));
+  form.append("invalidate", String(target.invalidate));
+
+  const res = await fetch(target.uploadUrl, { method: "POST", body: form });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Cloudinary direct upload failed (${res.status}): ${text}`);
+  }
+}
+
+// Step 1 + 2: issues an applicationId and uploads real images directly to Cloudinary for it.
+// Any of the three can be set to `undefined` in `images` to simulate that image never having
+// been uploaded at all.
+async function initAndStage(images = {}) {
+  const { json: init } = await apiPost("/api/applications/uploads/init", {});
+  const fields = {
+    idCardImage: validJpegBuffer,
+    ssnCardImage: validJpegBuffer,
+    selfieImage: validJpegBuffer,
+    ...images,
+  };
+  for (const [field, buffer] of Object.entries(fields)) {
+    if (buffer === undefined) continue;
+    await uploadToCloudinaryDirect(buffer, init.uploads[field]);
+  }
+  return init.applicationId;
+}
+
+// Step 3. `data` is either a plain object (merged with applicationId) or a raw string (sent
+// verbatim — for malformed-JSON tests). `applicationId`, when passed, skips initAndStage
+// entirely: pass a real one obtained from a prior initAndStage() call, or a fabricated
+// well-formed one for tests that only exercise validation of the *other* fields (those requests
+// are rejected before application.service.js ever looks up staged uploads, so no real Cloudinary
+// upload is needed for them at all).
+async function submitApplication({ data = validData(), images = {}, headers = {}, applicationId } = {}) {
+  const id = applicationId ?? (await initAndStage(images));
+  const body = typeof data === "string" ? data : JSON.stringify({ ...data, applicationId: id });
+  return apiPost("/api/applications", body, headers);
 }
 
 before(async () => {
@@ -147,8 +184,8 @@ after(async () => {
   await IdempotencyKey.deleteMany({});
   await mongoose.disconnect();
   await new Promise((resolve) => server.close(resolve));
-  // Real integration, not mocks — every test in this file that succeeds uploads real assets
-  // to Cloudinary under `uploadFolder`; delete that whole folder's contents in one call.
+  // Real integration, not mocks — every test in this file that stages an upload puts a real
+  // asset in Cloudinary under `uploadFolder`; delete that whole folder's contents in one call.
   await cloudinary.api.delete_resources_by_prefix(uploadFolder, { resource_type: "image", type: "authenticated" });
 });
 
@@ -156,7 +193,7 @@ describe("POST /api/applications", () => {
   test("accepts a valid submission with all three images and returns only a minimal confirmation", async () => {
     const before = await Application.countDocuments();
     const data = validData();
-    const { status, json } = await postForm("/api/applications", buildFormData({ data }));
+    const { status, json } = await submitApplication({ data });
 
     assert.equal(status, 201);
     assert.deepEqual(Object.keys(json).sort(), ["applicationId", "message", "success"]);
@@ -209,28 +246,28 @@ describe("POST /api/applications", () => {
   });
 
   test("forces status to 'submitted' server-side even if the client sends a status field", async () => {
+    // Rejected by zod before application.service.js ever looks at staged uploads, so a
+    // fabricated (never-initialized) applicationId is enough — no real Cloudinary calls needed.
     const data = { ...validData(), status: "approved" };
-    const { status, json } = await postForm("/api/applications", buildFormData({ data }));
+    const { status, json } = await submitApplication({ data, applicationId: generateApplicationId() });
 
     assert.equal(status, 400);
     assert.equal(json.success, false);
     assert.equal(json.code, "VALIDATION_ERROR");
   });
 
-  test("ignores/rejects a client-supplied applicationId and always generates its own", async () => {
+  test("rejects an applicationId that was never obtained from /uploads/init (no staged uploads)", async () => {
     const before = await Application.countDocuments();
-    const clientSuppliedId = "LN-19990101-ZZZZZZZ";
-    const data = { ...validData(), applicationId: clientSuppliedId };
-    const { status, json } = await postForm("/api/applications", buildFormData({ data }));
+    const fabricatedId = generateApplicationId();
 
-    // The request schema is `.strict()` and does not list applicationId among its accepted
-    // fields, so a client attempting to supply one is rejected outright rather than trusted.
+    const { status, json } = await submitApplication({ applicationId: fabricatedId });
+
     assert.equal(status, 400);
     assert.equal(json.code, "VALIDATION_ERROR");
     assert.equal(await Application.countDocuments(), before);
 
-    const stored = await Application.findOne({ applicationId: clientSuppliedId }).lean();
-    assert.equal(stored, null, "the client-supplied applicationId must never be persisted");
+    const stored = await Application.findOne({ applicationId: fabricatedId }).lean();
+    assert.equal(stored, null, "an applicationId with no real staged uploads must never result in a saved application");
   });
 
   test("rejects internal-only fields (status, creditScore, adminNotes) and stores nothing", async () => {
@@ -241,7 +278,7 @@ describe("POST /api/applications", () => {
       creditScore: 900,
       adminNotes: "approve immediately",
     };
-    const { status, json } = await postForm("/api/applications", buildFormData({ data }));
+    const { status, json } = await submitApplication({ data, applicationId: generateApplicationId() });
 
     assert.equal(status, 400);
     assert.equal(json.code, "VALIDATION_ERROR");
@@ -251,7 +288,7 @@ describe("POST /api/applications", () => {
   test("rejects a missing required field", async () => {
     const data = validData();
     delete data.applicant.firstName;
-    const { status, json } = await postForm("/api/applications", buildFormData({ data }));
+    const { status, json } = await submitApplication({ data, applicationId: generateApplicationId() });
     assert.equal(status, 400);
     assert.equal(json.code, "VALIDATION_ERROR");
   });
@@ -259,7 +296,7 @@ describe("POST /api/applications", () => {
   test("rejects an invalid email", async () => {
     const data = validData();
     data.applicant.email = "not-an-email";
-    const { status, json } = await postForm("/api/applications", buildFormData({ data }));
+    const { status, json } = await submitApplication({ data, applicationId: generateApplicationId() });
     assert.equal(status, 400);
     assert.equal(json.code, "VALIDATION_ERROR");
   });
@@ -267,7 +304,7 @@ describe("POST /api/applications", () => {
   test("rejects a negative loan amount", async () => {
     const data = validData();
     data.loanRequest.requestedLoanAmount = -500;
-    const { status, json } = await postForm("/api/applications", buildFormData({ data }));
+    const { status, json } = await submitApplication({ data, applicationId: generateApplicationId() });
     assert.equal(status, 400);
     assert.equal(json.code, "VALIDATION_ERROR");
   });
@@ -277,7 +314,7 @@ describe("POST /api/applications", () => {
     const data = validData();
     data.disbursement.bankDetails.bankRoutingNumber = "123456789";
 
-    const { status, json } = await postForm("/api/applications", buildFormData({ data }));
+    const { status, json } = await submitApplication({ data, applicationId: generateApplicationId() });
     assert.equal(status, 400);
     assert.equal(json.code, "VALIDATION_ERROR");
     assert.equal(await Application.countDocuments(), before);
@@ -288,7 +325,7 @@ describe("POST /api/applications", () => {
     const data = validData();
     data.disbursement.bankDetails.creditLimit = 50000;
 
-    const { status, json } = await postForm("/api/applications", buildFormData({ data }));
+    const { status, json } = await submitApplication({ data, applicationId: generateApplicationId() });
     assert.equal(status, 400);
     assert.equal(json.code, "VALIDATION_ERROR");
     assert.equal(await Application.countDocuments(), before);
@@ -298,7 +335,7 @@ describe("POST /api/applications", () => {
     const data = validData();
     data.disbursement.preferredMethod = "other";
 
-    const { status, json } = await postForm("/api/applications", buildFormData({ data }));
+    const { status, json } = await submitApplication({ data, applicationId: generateApplicationId() });
     assert.equal(status, 400);
     assert.equal(json.code, "VALIDATION_ERROR");
   });
@@ -307,7 +344,7 @@ describe("POST /api/applications", () => {
     const data = validData({
       loanHistory: [{ lenderName: "Bank", repaymentStatus: "not_a_real_status" }],
     });
-    const { status, json } = await postForm("/api/applications", buildFormData({ data }));
+    const { status, json } = await submitApplication({ data, applicationId: generateApplicationId() });
     assert.equal(status, 400);
     assert.equal(json.code, "VALIDATION_ERROR");
   });
@@ -316,8 +353,7 @@ describe("POST /api/applications", () => {
     for (const field of ["idCardImage", "ssnCardImage", "selfieImage"]) {
       test(`rejects a submission missing ${field} and stores nothing`, async () => {
         const before = await Application.countDocuments();
-        const form = buildFormData({ images: { [field]: undefined } });
-        const { status, json } = await postForm("/api/applications", form);
+        const { status, json } = await submitApplication({ images: { [field]: undefined } });
 
         assert.equal(status, 400);
         assert.equal(json.code, "VALIDATION_ERROR");
@@ -326,10 +362,21 @@ describe("POST /api/applications", () => {
       });
     }
 
-    test("rejects a non-image file disguised as a required image and stores nothing", async () => {
+    test("rejects a non-image file disguised as a required image and stores nothing", async (t) => {
       const before = await Application.countDocuments();
-      const form = buildFormData({ images: { selfieImage: Buffer.from("not an image") } });
-      const { status, json } = await postForm("/api/applications", form);
+      // A real Cloudinary upload would itself refuse non-image content for an /image/upload
+      // target, so this exercises our own decode validation directly: two images are staged
+      // for real, and the third's staged-fetch result is simulated.
+      const applicationId = await initAndStage({ selfieImage: undefined });
+      const realFetch = cloudinaryStorage.fetchStagedUpload.bind(cloudinaryStorage);
+      t.mock.method(cloudinaryStorage, "fetchStagedUpload", async (publicId) => {
+        if (publicId.endsWith("selfie-staging")) {
+          return { buffer: Buffer.from("not an image"), bytes: 13 };
+        }
+        return realFetch(publicId);
+      });
+
+      const { status, json } = await submitApplication({ applicationId });
 
       assert.equal(status, 400);
       assert.equal(json.code, "INVALID_IMAGE");
@@ -344,21 +391,27 @@ describe("POST /api/applications", () => {
         .jpeg()
         .toBuffer();
 
-      const form = buildFormData({ images: { selfieImage: tiny } });
-      const { status, json } = await postForm("/api/applications", form);
+      const { status, json } = await submitApplication({ images: { selfieImage: tiny } });
       assert.equal(status, 400);
       assert.equal(json.code, "INVALID_IMAGE");
       assert.equal(await Application.countDocuments(), before);
     });
 
-    test("rejects an oversized image", async () => {
-      // upload.js reads MAX_DOCUMENT_UPLOAD_SIZE_BYTES once at import time (default 8MB), so
-      // this exercises that real default directly rather than trying to override it post-hoc.
+    test("rejects an oversized image", async (t) => {
+      // Same reasoning as the disguised non-image test above: a genuine 9MB upload of random
+      // bytes isn't a real image Cloudinary would store, so the oversized *staged asset* is
+      // simulated directly rather than actually transferring 9MB to a real /image/upload target.
       const before = await Application.countDocuments();
-      const oversized = Buffer.alloc(9 * 1024 * 1024, 0xff);
+      const applicationId = await initAndStage({ selfieImage: undefined });
+      const realFetch = cloudinaryStorage.fetchStagedUpload.bind(cloudinaryStorage);
+      t.mock.method(cloudinaryStorage, "fetchStagedUpload", async (publicId) => {
+        if (publicId.endsWith("selfie-staging")) {
+          return { buffer: Buffer.alloc(1024, 0xff), bytes: 9 * 1024 * 1024 };
+        }
+        return realFetch(publicId);
+      });
 
-      const form = buildFormData({ images: { selfieImage: oversized } });
-      const { status } = await postForm("/api/applications", form);
+      const { status } = await submitApplication({ applicationId });
       assert.equal(status, 413);
       assert.equal(await Application.countDocuments(), before);
     });
@@ -367,6 +420,7 @@ describe("POST /api/applications", () => {
   describe("upload/save failure handling (no orphaned data)", () => {
     test("rolls back already-uploaded Cloudinary assets if a later image fails to upload", async (t) => {
       const before = await Application.countDocuments();
+      const applicationId = await initAndStage();
       const deleted = [];
       let callCount = 0;
 
@@ -388,16 +442,25 @@ describe("POST /api/applications", () => {
         deleted.push(asset.publicId);
       });
 
-      const { status, json } = await postForm("/api/applications", buildFormData());
+      const { status, json } = await submitApplication({ applicationId });
       assert.equal(status, 500);
       assert.equal(json.code, "INTERNAL_ERROR");
       assert.ok(!("stack" in json));
       assert.equal(await Application.countDocuments(), before, "no application should be saved");
-      assert.deepEqual(deleted, ["simulated/id_card"], "only the one asset that actually uploaded should be rolled back");
+
+      // The one final/processed asset that actually uploaded before the simulated failure is
+      // rolled back first, then (regardless of that failure) the three raw staging uploads are
+      // always cleaned up too — see the `finally` block in application.service.js.
+      assert.equal(deleted[0], "simulated/id_card", "only the one asset that actually uploaded should be rolled back");
+      const expectedStagingIds = ["id_card", "ssn_card", "selfie"].map((kind) =>
+        cloudinaryStorage.buildStagingPublicId(applicationId, kind, "staging")
+      );
+      assert.deepEqual(deleted.slice(1).sort(), expectedStagingIds.sort());
     });
 
     test("rolls back all uploaded Cloudinary assets if the MongoDB save fails", async (t) => {
       const before = await Application.countDocuments();
+      const applicationId = await initAndStage();
       const uploadedPublicIds = [];
 
       // Real Cloudinary calls (wraps the real implementation), only Mongo is mocked — proves
@@ -412,7 +475,7 @@ describe("POST /api/applications", () => {
         throw new Error("simulated MongoDB outage");
       });
 
-      const { status, json } = await postForm("/api/applications", buildFormData());
+      const { status, json } = await submitApplication({ applicationId });
       assert.equal(status, 500);
       assert.equal(json.code, "INTERNAL_ERROR");
       assert.equal(await Application.countDocuments(), before, "no application should be saved");
@@ -432,11 +495,12 @@ describe("POST /api/applications", () => {
     const key = `test-${randomUUID()}`;
     const before = await Application.countDocuments();
 
-    const first = await postForm("/api/applications", buildFormData(), {
-      "Idempotency-Key": key,
-    });
-    const second = await postForm("/api/applications", buildFormData(), {
-      "Idempotency-Key": key,
+    const first = await submitApplication({ headers: { "Idempotency-Key": key } });
+    // The idempotency check short-circuits before staged uploads are ever looked at, so the
+    // replay doesn't need a second real set of Cloudinary uploads — any well-formed id works.
+    const second = await submitApplication({
+      applicationId: generateApplicationId(),
+      headers: { "Idempotency-Key": key },
     });
 
     assert.equal(first.status, 201);
@@ -448,32 +512,34 @@ describe("POST /api/applications", () => {
   });
 
   test("rejects a malformed Idempotency-Key header", async () => {
-    const { status, json } = await postForm("/api/applications", buildFormData(), {
-      "Idempotency-Key": "!!!",
+    // Rejected before submitApplication runs, so no real staged uploads are needed.
+    const { status, json } = await submitApplication({
+      applicationId: generateApplicationId(),
+      headers: { "Idempotency-Key": "!!!" },
     });
     assert.equal(status, 400);
     assert.equal(json.code, "INVALID_IDEMPOTENCY_KEY");
   });
 
-  test("rejects malformed JSON in the 'data' field without leaking internals", async () => {
-    const { status, json, text } = await postForm(
-      "/api/applications",
-      buildFormData({ data: "{not valid json" })
-    );
+  test("rejects malformed JSON in the request body without leaking internals", async () => {
+    const { status, json, text } = await apiPost("/api/applications", "{not valid json");
     assert.equal(status, 400);
     assert.equal(json.code, "MALFORMED_JSON");
     assert.ok(!/at JSON\.parse|node_modules|\.js:\d+/.test(text), "response must not leak stack/file details");
   });
 
   test("error responses never include stack traces or internal details", async () => {
-    const { json } = await postForm("/api/applications", buildFormData({ data: { applicant: {} } }));
+    const { json } = await submitApplication({
+      data: { applicant: {} },
+      applicationId: generateApplicationId(),
+    });
     assert.ok(!("stack" in json));
     const serialized = JSON.stringify(json);
     assert.ok(!/node_modules|at .*\.js:\d+:\d+/.test(serialized));
   });
 
   test("does not leak the X-Powered-By header", async () => {
-    const { headers } = await postForm("/api/applications", buildFormData());
+    const { headers } = await submitApplication();
     assert.equal(headers.get("x-powered-by"), null);
   });
 });
@@ -482,7 +548,7 @@ describe("applicant data exposure / IDOR", () => {
   let applicationId;
 
   before(async () => {
-    const { json } = await postForm("/api/applications", buildFormData());
+    const { json } = await submitApplication();
     applicationId = json.applicationId;
   });
 

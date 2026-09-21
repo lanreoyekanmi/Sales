@@ -67,6 +67,13 @@ export const DOCUMENT_UPLOAD_FIELDS = {
 
 export const DOCUMENT_KINDS = Object.values(DOCUMENT_UPLOAD_FIELDS);
 
+// Enforced in application.service.js / documentUpload.service.js, right after fetching a
+// staged upload back from Cloudinary and before processUploadedImage runs — the browser
+// uploads directly to Cloudinary (see services/cloudinaryStorage.adapter.js), so this can no
+// longer be enforced up front by multer the way it was before the Vercel migration.
+export const MAX_DOCUMENT_UPLOAD_SIZE_BYTES =
+  Number(process.env.MAX_DOCUMENT_UPLOAD_SIZE_BYTES) || 8 * 1024 * 1024;
+
 // Tracks whether the operational Telegram notification for a submitted application has been
 // sent. Internal/operational only — never returned in any API response.
 export const TELEGRAM_NOTIFICATION_STATUSES = ["pending", "sent", "failed"];

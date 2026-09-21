@@ -2,12 +2,16 @@ import Application from "../models/application.model.js";
 import ApiError from "../utils/ApiError.js";
 import logger from "../utils/logger.js";
 import { processUploadedImage, InvalidImageError } from "../utils/imageProcessing.js";
-import { cloudinaryStorage } from "./cloudinaryStorage.adapter.js";
+import { cloudinaryStorage, STAGED_UPLOAD_NOT_FOUND } from "./cloudinaryStorage.adapter.js";
+import { MAX_DOCUMENT_UPLOAD_SIZE_BYTES } from "../config/constants.js";
 
 /**
- * @param {object} params - { applicationId, kind, buffer, requestId }
+ * @param {object} params - { applicationId, kind, requestId }
+ *   The replacement image itself already reached Cloudinary directly from the browser via
+ *   POST /api/applications/:applicationId/documents/init — this call fetches it back, processes
+ *   it, and only then touches MongoDB.
  */
-export async function uploadApplicationDocument({ applicationId, kind, buffer, requestId }) {
+export async function uploadApplicationDocument({ applicationId, kind, requestId }) {
   // publicId is select:false on the schema — this is the one place that needs it, to know
   // what to clean up afterward, so it must be explicitly opted back in.
   const application = await Application.findOne({ applicationId })
@@ -19,11 +23,30 @@ export async function uploadApplicationDocument({ applicationId, kind, buffer, r
     throw new ApiError(404, "APPLICATION_NOT_FOUND", "No application was found for this ID.");
   }
 
+  const stagingPublicId = cloudinaryStorage.buildStagingPublicId(applicationId, kind, "retake-staging");
+  let staged;
+  try {
+    staged = await cloudinaryStorage.fetchStagedUpload(stagingPublicId);
+  } catch (err) {
+    if (err?.code === STAGED_UPLOAD_NOT_FOUND) {
+      throw new ApiError(400, "VALIDATION_ERROR", "An image file is required.", [
+        { field: "image", message: "An 'image' file part is required." },
+      ]);
+    }
+    throw err;
+  }
+
+  if (staged.bytes > MAX_DOCUMENT_UPLOAD_SIZE_BYTES) {
+    await cloudinaryStorage.deleteDocumentFile({ publicId: stagingPublicId }).catch(() => {});
+    throw new ApiError(413, "PAYLOAD_TOO_LARGE", "Uploaded file is too large.");
+  }
+
   let processed;
   try {
-    processed = await processUploadedImage(buffer);
+    processed = await processUploadedImage(staged.buffer);
   } catch (err) {
     if (err instanceof InvalidImageError) {
+      await cloudinaryStorage.deleteDocumentFile({ publicId: stagingPublicId }).catch(() => {});
       throw new ApiError(400, "INVALID_IMAGE", "The uploaded file is not a valid image.");
     }
     throw err;
@@ -71,6 +94,10 @@ export async function uploadApplicationDocument({ applicationId, kind, buffer, r
     }
   } catch (err) {
     await cloudinaryStorage.deleteDocumentFile(uploaded).catch(() => {});
+    // Same reasoning as the finally block in application.service.js's submitApplication: a
+    // failed attempt must never leave stale bytes sitting at this deterministic staging
+    // public_id for a later retry to silently reuse.
+    await cloudinaryStorage.deleteDocumentFile({ publicId: stagingPublicId }).catch(() => {});
     logger.warn("document_replace_rolled_back", { requestId, applicationId, kind });
     throw err;
   }
@@ -84,6 +111,11 @@ export async function uploadApplicationDocument({ applicationId, kind, buffer, r
       logger.warn("previous_document_cleanup_failed", { requestId, applicationId, kind });
     });
   }
+
+  // The raw staging upload is no longer needed now that the processed version is the asset of
+  // record — best-effort, same fire-and-forget cleanup style as the previous-document delete
+  // above.
+  cloudinaryStorage.deleteDocumentFile({ publicId: stagingPublicId }).catch(() => {});
 
   logger.info("application_document_uploaded", { requestId, applicationId, kind });
 

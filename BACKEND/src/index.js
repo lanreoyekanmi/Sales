@@ -5,6 +5,10 @@ import { telegramNotifier } from "./services/telegram.service.js";
 
 const startServer = async () => {
   try {
+    // process.exit belongs only here (the local dev/standalone-server bootstrap) — the Vercel
+    // Function entrypoint (api/[...path].js) calls the same connectDB() but must never exit
+    // the process on a connection failure, since that could tear down a container serving
+    // other concurrent invocations; it returns a 502 for that one request instead.
     await connectDB();
 
     app.on("error", (err) => {

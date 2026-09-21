@@ -8,8 +8,42 @@ info:
 servers:
   - url: http://localhost:5001/api
     description: Local development (matches PORT in .env)
+  - url: https://meridianloan.vercel.app/api
+    description: Production (same origin as the frontend — served by a Vercel Function)
 
 paths:
+  /applications/uploads/init:
+    post:
+      operationId: initApplicationUploads
+      summary: Issue an applicationId and signed direct-to-Cloudinary upload targets
+      description: >
+        Step 1 of submission. The three required verification images are uploaded directly
+        from the browser to Cloudinary (never through this API — a Vercel Function request body
+        is capped at 4.5MB), using the signed parameters this endpoint returns. Step 2 is the
+        browser uploading to Cloudinary with them; step 3 is POST /applications below.
+      responses:
+        "201":
+          description: Upload targets issued.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  applicationId: { type: string, example: LN-20260913-A7K4P9X }
+                  uploads:
+                    type: object
+                    properties:
+                      idCardImage: { $ref: '#/components/schemas/CloudinaryUploadTarget' }
+                      ssnCardImage: { $ref: '#/components/schemas/CloudinaryUploadTarget' }
+                      selfieImage: { $ref: '#/components/schemas/CloudinaryUploadTarget' }
+                required: [success, applicationId, uploads]
+        "429":
+          description: Rate limit exceeded for this IP.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
   /applications:
     get:
       operationId: listApplications_DOES_NOT_EXIST
@@ -24,21 +58,21 @@ paths:
       operationId: createApplication
       summary: Submit a new loan application
       description: >
-        The only public creation endpoint on this resource. multipart/form-data, not JSON:
-        the application fields travel as a JSON string in the "data" part, alongside three
-        required image files. The application is never created if any of the three is
-        missing or fails to decode as an image — nothing is persisted without them. Any field
-        not defined in the ApplicationSubmission schema (status, creditScore, adminNotes,
-        riskScore, interestRate, approvalStatus, etc.), at any nesting level, is rejected with
-        VALIDATION_ERROR rather than stored.
+        Step 3 of submission (see POST /applications/uploads/init above) — plain JSON, no file
+        bytes. applicationId must be one returned by that endpoint, with all three images
+        already uploaded to Cloudinary under it; the server fetches them back from Cloudinary
+        itself and rejects the request (VALIDATION_ERROR) if any is missing or fails to decode
+        as an image. Any field not defined in the ApplicationSubmission schema (status,
+        creditScore, adminNotes, riskScore, interestRate, approvalStatus, etc.), at any nesting
+        level, is rejected with VALIDATION_ERROR rather than stored.
       parameters:
         - in: header
           name: Idempotency-Key
           required: false
           description: >
-            8-128 chars, [A-Za-z0-9_-]. Send the same key (and the same files) when retrying a
-            submission (double-click, network retry) to get back the original result instead
-            of creating a second application and re-processing the images.
+            8-128 chars, [A-Za-z0-9_-]. Send the same key when retrying a submission
+            (double-click, network retry) to get back the original result instead of creating a
+            second application.
           schema:
             type: string
             pattern: '^[A-Za-z0-9_-]{8,128}$'
@@ -46,31 +80,8 @@ paths:
       requestBody:
         required: true
         content:
-          multipart/form-data:
-            schema:
-              type: object
-              required: [data, idCardImage, ssnCardImage, selfieImage]
-              properties:
-                data:
-                  type: string
-                  description: JSON-encoded ApplicationSubmission object (see schema below).
-                  example: >-
-                    {"applicant":{"firstName":"Jane","lastName":"Doe","email":"jane@example.com","phoneNumber":"+1 555-123-4567","dateOfBirth":"1990-01-01","residentialAddress":"123 Main St","city":"Springfield","state":"IL"},"employment":{"employmentStatus":"employed","employerName":"Acme Corp","monthlyIncome":4500,"incomeFrequency":"monthly"},"loanRequest":{"requestedLoanAmount":10000,"loanPurpose":"Home renovation","preferredRepaymentPeriodMonths":24,"repaymentFrequency":"monthly"},"loanHistory":[],"disbursement":{"preferredMethod":"direct_deposit","bankDetails":{"accountHolderName":"Jane Doe","bankRoutingNumber":"011401533","accountNumber":"1234567890","accountType":"checking","bankType":"bank"}},"consent":{"termsAccepted":true,"dataProcessingAccepted":true}}
-                idCardImage:
-                  type: string
-                  format: binary
-                  description: Photo of a government-issued ID card. JPEG, PNG, or WEBP.
-                ssnCardImage:
-                  type: string
-                  format: binary
-                  description: Photo of the applicant's SSN card/document. JPEG, PNG, or WEBP.
-                selfieImage:
-                  type: string
-                  format: binary
-                  description: A selfie for identity verification. JPEG, PNG, or WEBP.
-              encoding:
-                data:
-                  contentType: application/json
+          application/json:
+            schema: { $ref: '#/components/schemas/ApplicationSubmission' }
       responses:
         "201":
           description: Application submitted successfully.
@@ -129,16 +140,13 @@ paths:
         "404":
           description: Not found, by design.
 
-  /applications/{applicationId}/documents:
+  /applications/{applicationId}/documents/init:
     post:
-      operationId: replaceApplicationDocument
-      summary: Replace one verification image on an existing application
+      operationId: initDocumentUpload
+      summary: Issue a signed direct-to-Cloudinary upload target for one document retake
       description: >
-        For retakes only (e.g. a blurry ID photo) — the application already has all three
-        images from creation. applicationId is the only access control: it grants no read
-        access to any applicant data, only permission to replace one image on that specific
-        application. Same IDOR caveat as the Idempotency-Key design: do not rely on this
-        alone if the threat model changes.
+        Step 1 of a retake — same reasoning as POST /applications/uploads/init above, scoped to
+        a single document kind on an application that already exists.
       parameters:
         - in: path
           name: applicationId
@@ -147,13 +155,63 @@ paths:
       requestBody:
         required: true
         content:
-          multipart/form-data:
+          application/json:
             schema:
               type: object
-              required: [kind, image]
+              required: [kind]
               properties:
                 kind: { type: string, enum: [id_card, ssn_card, selfie] }
-                image: { type: string, format: binary }
+      responses:
+        "201":
+          description: Upload target issued.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  upload: { $ref: '#/components/schemas/CloudinaryUploadTarget' }
+        "400":
+          description: Invalid kind.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        "404":
+          description: No application exists for this applicationId.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        "429":
+          description: Rate limit exceeded for this IP.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /applications/{applicationId}/documents:
+    post:
+      operationId: replaceApplicationDocument
+      summary: Confirm a replaced verification image on an existing application
+      description: >
+        Step 2 of a retake (see POST /applications/{applicationId}/documents/init above) — the
+        image itself was already uploaded directly to Cloudinary; this call just confirms the
+        kind so the server can fetch it back, process it, and update MongoDB. applicationId is
+        the only access control: it grants no read access to any applicant data, only
+        permission to replace one image on that specific application. Same IDOR caveat as the
+        Idempotency-Key design: do not rely on this alone if the threat model changes.
+      parameters:
+        - in: path
+          name: applicationId
+          required: true
+          schema: { type: string, example: LN-20260913-A7K4P9X }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [kind]
+              properties:
+                kind: { type: string, enum: [id_card, ssn_card, selfie] }
       responses:
         "201":
           description: Document replaced successfully.
@@ -191,8 +249,14 @@ components:
     ApplicationSubmission:
       type: object
       additionalProperties: false
-      required: [applicant, employment, loanRequest, disbursement, consent]
+      required: [applicationId, applicant, employment, loanRequest, disbursement, consent]
       properties:
+        applicationId:
+          type: string
+          example: LN-20260913-A7K4P9X
+          description: >
+            Must be a value returned by POST /applications/uploads/init, with all three
+            required images already uploaded to Cloudinary under it.
         applicant: { $ref: '#/components/schemas/Applicant' }
         employment: { $ref: '#/components/schemas/Employment' }
         loanRequest: { $ref: '#/components/schemas/LoanRequest' }
@@ -294,6 +358,24 @@ components:
       properties:
         termsAccepted: { type: boolean, enum: [true] }
         dataProcessingAccepted: { type: boolean, enum: [true] }
+
+    CloudinaryUploadTarget:
+      type: object
+      description: >
+        Everything the browser needs to upload one file directly to Cloudinary. apiKey and
+        signature are safe to expose — signature is computed server-side with the Cloudinary
+        API secret (never sent to the browser) and only authorizes uploading to this exact
+        publicId.
+      properties:
+        uploadUrl: { type: string, format: uri, example: "https://api.cloudinary.com/v1_1/<cloud_name>/image/upload" }
+        cloudName: { type: string }
+        apiKey: { type: string }
+        timestamp: { type: integer }
+        signature: { type: string }
+        publicId: { type: string }
+        type: { type: string, enum: [authenticated] }
+        overwrite: { type: boolean, enum: [true] }
+        invalidate: { type: boolean, enum: [true] }
 
     ErrorResponse:
       type: object

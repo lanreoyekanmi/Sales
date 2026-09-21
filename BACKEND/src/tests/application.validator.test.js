@@ -1,9 +1,11 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 import { applicationSubmissionSchema } from "../validators/application.validator.js";
+import { generateApplicationId } from "../utils/applicationId.js";
 
 function validPayload(overrides = {}) {
   return {
+    applicationId: generateApplicationId(),
     applicant: {
       firstName: "Jane",
       lastName: "Doe",
@@ -279,6 +281,28 @@ describe("applicationSubmissionSchema", () => {
     });
     const result = applicationSubmissionSchema.safeParse(payload);
     assert.equal(result.success, true);
+  });
+
+  test("rejects a missing applicationId", () => {
+    const payload = validPayload();
+    delete payload.applicationId;
+    const result = applicationSubmissionSchema.safeParse(payload);
+    assert.equal(result.success, false);
+    assert.ok(result.error.issues.some((i) => i.path.join(".") === "applicationId"));
+  });
+
+  test("rejects an applicationId not in the LN-YYYYMMDD-XXXXXXX format", () => {
+    for (const badId of ["not-an-id", "LN-2026-ABC", "ln-20260913-a7k4p9x"]) {
+      const result = applicationSubmissionSchema.safeParse(validPayload({ applicationId: badId }));
+      assert.equal(result.success, false, `expected ${badId} to be rejected`);
+    }
+  });
+
+  test("rejects the legacy UUID applicationId format — only newly-issued ids are accepted here", () => {
+    const result = applicationSubmissionSchema.safeParse(
+      validPayload({ applicationId: "1d6e6b0a-8f6e-4b9a-9c0d-3a2f6e6b0a8f" })
+    );
+    assert.equal(result.success, false);
   });
 
   test("rejects unknown fields nested inside bankDetails", () => {

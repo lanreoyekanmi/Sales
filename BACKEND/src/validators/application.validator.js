@@ -15,6 +15,7 @@ import {
   MIN_REQUESTED_LOAN_AMOUNT,
   REPAYMENT_FREQUENCIES,
 } from "../config/constants.js";
+import { NEW_APPLICATION_ID_REGEX } from "../utils/applicationId.js";
 
 // This module is the single source of truth for what the public submission endpoint may
 // accept. Every object schema is `.strict()`, so any field not explicitly listed here
@@ -186,8 +187,19 @@ const consentSchema = z
   })
   .strict();
 
+// Echoed back from the response of POST /api/applications/uploads/init (see
+// controllers/uploadInit.controller.js) — never accepted in the legacy UUID shape, since that
+// shape only ever originates server-side for applications created before this format existed.
+// This is not "trusting client input" in the old mass-assignment sense: application.service.js
+// never persists this value as-is without also independently deriving and fetching the staged
+// Cloudinary uploads it names, so a well-formed-but-never-initialized id is rejected there.
+const applicationIdSchema = z
+  .string()
+  .regex(NEW_APPLICATION_ID_REGEX, "applicationId is invalid or expired.");
+
 export const applicationSubmissionSchema = z
   .object({
+    applicationId: applicationIdSchema,
     applicant: applicantSchema,
     employment: employmentSchema,
     loanRequest: loanRequestSchema,
